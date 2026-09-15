@@ -1370,3 +1370,148 @@ cat("\nStep 9 complete. Output saved to:\n", out_path, "\n")
 
 
 
+
+
+
+
+
+
+
+# =========================================================
+# negatifstep10.R
+# Negative Transfer pilot - Step 10 (APPENDIX / ROBUSTNESS,
+# continued): leave-one-crop-out (LOCO) validation and a
+# crop-stratified permutation test for delta-LogME (Step 9),
+# using the exact same protocol already applied to the
+# Mahalanobis-distance predictors in Steps 5 and 7. This is
+# a cheap addition: it re-reads Step 9's already-computed
+# delta-LogME values and does not refit any LASSO models.
+# =========================================================
+
+library(readxl)    # read xlsx input
+library(openxlsx)  # write xlsx output
+library(dplyr)      # data manipulation
+library(xgboost)    # nonlinear classifier (single-feature, for consistency with steps 5/7)
+
+set.seed(42)
+
+# ---- 0. Folder paths (same convention as steps 1-9) ----
+data_dir <- "C:/Users/Alper.Tosun/Desktop/cru130"
+proj_dir <- file.path(data_dir, "negatif_transfer")
+
+# ---- 1. Load step-9 output ----
+step9_path <- file.path(proj_dir, "negstep9_output.xlsx")
+feat <- read_excel(step9_path, sheet = "pairwise_deltaLogME")   # crop, target, candidate, logme_S, logme_Ss, delta_logme, NT_lasso, NT_xgb
+
+crops_in_feat <- unique(feat$crop)
+cat("Crops:", paste(crops_in_feat, collapse = ", "), "\n")
+
+feature_cols <- c("delta_logme")   # single feature, consistent with how D_mahalanobis alone was tested
+
+# ---- AUROC / PR-AUC helpers (same as previous steps) ----
+auroc <- function(scores, labels) {
+  n1 <- sum(labels == 1); n0 <- sum(labels == 0)
+  if (n1 == 0 || n0 == 0) return(NA)
+  r <- rank(scores)
+  (sum(r[labels == 1]) - n1 * (n1 + 1) / 2) / (n1 * n0)
+}
+pr_auc <- function(scores, labels) {
+  ord <- order(-scores)
+  lab <- labels[ord]
+  tp <- cumsum(lab); fp <- cumsum(1 - lab)
+  precision <- tp / (tp + fp); recall <- tp / sum(lab)
+  auc <- 0; prev_r <- 0; prev_p <- 1
+  for (i in seq_along(recall)) {
+    auc <- auc + (recall[i] - prev_r) * (precision[i] + prev_p) / 2
+    prev_r <- recall[i]; prev_p <- precision[i]
+  }
+  auc
+}
+
+# ---- LOCO with delta_logme as the sole predictor ----
+run_loco <- function(nt_col) {
+  y_all <- as.integer(feat[[nt_col]] < 0)
+  x_all <- as.matrix(feat[, feature_cols, drop = FALSE])
+  crops_here <- unique(feat$crop)
+
+  oof_pred <- numeric(nrow(feat))
+  per_crop <- list()
+
+  for (held_out in crops_here) {
+    train_idx <- which(feat$crop != held_out)
+    test_idx  <- which(feat$crop == held_out)
+    if (length(test_idx) == 0) next
+
+    model <- xgboost(x = x_all[train_idx, , drop = FALSE], y = factor(y_all[train_idx]),
+                      nrounds = 100, max_depth = 3, learning_rate = 0.1,
+                      objective = "binary:logistic")
+    pred <- predict(model, x_all[test_idx, , drop = FALSE])
+    oof_pred[test_idx] <- pred
+
+    per_crop[[held_out]] <- data.frame(
+      nt_column = nt_col, held_out_crop = held_out, n_test = length(test_idx),
+      auroc = auroc(pred, y_all[test_idx]), pr_auc = pr_auc(pred, y_all[test_idx])
+    )
+  }
+
+  list(
+    per_crop = bind_rows(per_crop),
+    oof_pred = oof_pred,
+    y_all    = y_all
+  )
+}
+
+# ---- Permutation test (stratified by crop) - identical protocol to step 7 ----
+permutation_test <- function(oof_pred, y_all, crop_vec, n_perm = 500) {
+  observed <- auroc(oof_pred, y_all)
+  perm_stats <- numeric(n_perm)
+  for (p in 1:n_perm) {
+    y_perm <- y_all
+    for (c in unique(crop_vec)) {
+      idx <- which(crop_vec == c)
+      y_perm[idx] <- sample(y_all[idx])
+    }
+    perm_stats[p] <- auroc(oof_pred, y_perm)
+  }
+  p_value <- mean(abs(perm_stats - 0.5) >= abs(observed - 0.5))
+  list(observed = observed, p_value = p_value, perm_mean = mean(perm_stats), perm_sd = sd(perm_stats))
+}
+
+# ---- Run everything ----
+res_lasso <- run_loco("NT_lasso")
+res_xgb   <- run_loco("NT_xgb")
+
+perm_lasso <- permutation_test(res_lasso$oof_pred, res_lasso$y_all, feat$crop)
+perm_xgb   <- permutation_test(res_xgb$oof_pred,   res_xgb$y_all,   feat$crop)
+
+summary_tbl <- bind_rows(
+  data.frame(nt_column = "NT_lasso", observed_auroc = perm_lasso$observed,
+             permutation_p_value = perm_lasso$p_value,
+             null_mean = perm_lasso$perm_mean, null_sd = perm_lasso$perm_sd),
+  data.frame(nt_column = "NT_xgb", observed_auroc = perm_xgb$observed,
+             permutation_p_value = perm_xgb$p_value,
+             null_mean = perm_xgb$perm_mean, null_sd = perm_xgb$perm_sd)
+)
+
+cat("\n--- delta-LogME: LOCO permutation test summary ---\n")
+print(summary_tbl)
+
+per_crop_all <- bind_rows(res_lasso$per_crop, res_xgb$per_crop)
+cat("\n--- delta-LogME: per-crop LOCO results ---\n")
+print(per_crop_all)
+
+# ---- Save everything as Excel (no RDS) ----
+out_path <- file.path(proj_dir, "negstep10_output.xlsx")
+
+wb <- createWorkbook()
+addWorksheet(wb, "permutation_summary")   # observed AUROC vs. null distribution, p-value
+addWorksheet(wb, "loco_per_crop")         # per-crop LOCO AUROC/PR-AUC for delta_logme
+
+writeData(wb, "permutation_summary", summary_tbl)
+writeData(wb, "loco_per_crop", per_crop_all)
+
+saveWorkbook(wb, out_path, overwrite = TRUE)
+
+cat("\nStep 10 complete. Output saved to:\n", out_path, "\n")
+
+
