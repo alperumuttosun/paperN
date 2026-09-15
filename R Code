@@ -1134,3 +1134,239 @@ save_figure(fig2, "fig2_loco_auroc")
 # without also implying a color legend for crop, which would clutter the figure. ----
 cat("\nFigures saved to:", fig_dir, "\n")
 cat("Reminder: filled bar = LASSO-based NT, hollow (outline-only) bar = XGBoost-based NT, per-crop color per Table 1 / crop_colors.\n")
+
+
+
+
+
+
+
+
+
+
+
+
+
+# =========================================================
+# negatifstep9.R
+# Negative Transfer pilot - Step 9 (APPENDIX / ROBUSTNESS):
+# LogME, a standard transferability-estimation metric from the
+# literature (Li et al. 2021, "LogME: Practical Assessment of
+# Pre-trained Models for Transfer Learning"), adapted to our
+# pooled-regression setting, to check whether an established
+# literature baseline predicts negative transfer any better than
+# the Mahalanobis-distance measures used in Steps 2-7.
+#
+# ADAPTATION NOTE: LogME normally scores how well a pretrained
+# model's learned REPRESENTATION of the target data explains the
+# target labels, without fine-tuning. We do not have learned
+# representations here (no deep network), so we use the natural
+# analogue for a pooled regression setting: the fitted model's
+# own PREDICTION on the target (a 1-dimensional "feature") is
+# scored, via LogME's Bayesian evidence-maximization procedure,
+# against the target's true (log) yield. This requires no
+# retraining beyond what Step 2 already does, and needs no
+# target labels beyond what NT itself already uses.
+#
+# SCOPE NOTE: this step only uses the LASSO model (not XGBoost).
+# LogME's Gaussian-linear evidence framework pairs most naturally
+# with a linear model's output, and restricting to one model
+# keeps this supplementary check's computational cost bounded
+# (it otherwise duplicates all of Step 2's model fitting).
+# =========================================================
+
+library(readxl)    # read xlsx input
+library(openxlsx)  # write xlsx output
+library(dplyr)      # data manipulation
+library(glmnet)     # LASSO
+
+set.seed(42)
+
+# ---- 0. Folder paths (same convention as steps 1-7) ----
+data_dir <- "C:/Users/Alper.Tosun/Desktop/cru130"
+proj_dir <- file.path(data_dir, "negatif_transfer")
+
+# ---- 1. Load step-1 (country roles) and step-2 (NT values, to compare against) ----
+step1_path <- file.path(proj_dir, "negstep1_output.xlsx")
+step2_path <- file.path(proj_dir, "negstep2_output.xlsx")
+
+selection <- read_excel(step1_path, sheet = "selection")   # crop, country, role
+nt_values <- read_excel(step2_path, sheet = "pairwise_results") %>%
+  select(crop, target, candidate, NT_lasso, NT_xgb)
+
+crops_available <- unique(selection$crop)
+cat("Crops:", paste(crops_available, collapse = ", "), "\n")
+
+feature_cols <- c("TMX_ann", "PRE_ann", "GDP_per_Capita")   # same final spec as step 2
+
+# ---- Function: fit LASSO on train_df, return PREDICTIONS on test_df (log-yield scale) ----
+fit_lasso_predict <- function(train_df, test_df) {
+  x_train <- as.matrix(train_df[, feature_cols])
+  y_train <- log(train_df$yield_hg_per_ha)
+  x_test  <- as.matrix(test_df[, feature_cols])
+
+  cvfit <- cv.glmnet(x_train, y_train, alpha = 1, nfolds = 5)
+  as.numeric(predict(cvfit, newx = x_test, s = "lambda.min"))   # predictions, log-yield scale
+}
+
+# ---- Function: LogME for a 1-dimensional "feature" f explaining target y ----
+# Standard evidence-maximization (MacKay-style) Bayesian linear regression,
+# specialized to a single predictor (d = 1), following Li et al. (2021).
+# Returns the per-observation log marginal likelihood (log evidence / n),
+# the paper's own normalization so scores are comparable across sample sizes.
+compute_logme <- function(f, y) {
+  n  <- length(f)
+  ff <- sum(f^2)
+  fy <- sum(f * y)
+
+  alpha <- 1; beta <- 1   # initial precision hyperparameters
+  for (iter in 1:200) {
+    A       <- alpha + beta * ff
+    w_mp    <- beta * fy / A                       # posterior mean weight
+    gamma   <- beta * ff / A                        # effective number of parameters (in [0,1] since d=1)
+    resid   <- sum((y - f * w_mp)^2)
+    alpha_new <- gamma / (w_mp^2 + 1e-8)
+    beta_new  <- (n - gamma) / (resid + 1e-8)
+    if (abs(alpha_new - alpha) < 1e-6 && abs(beta_new - beta) < 1e-6) {
+      alpha <- alpha_new; beta <- beta_new
+      break
+    }
+    alpha <- alpha_new; beta <- beta_new
+  }
+
+  A     <- alpha + beta * ff
+  w_mp  <- beta * fy / A
+  resid <- sum((y - f * w_mp)^2)
+
+  logme <- 0.5 * n * log(beta) - 0.5 * n * log(2 * pi) +
+           0.5 * log(alpha) - 0.5 * log(A) -
+           0.5 * beta * resid - 0.5 * alpha * w_mp^2
+
+  logme / n   # normalized, per the original paper's convention
+}
+
+# ---- Process a single crop: compute delta-LogME for every (target, candidate) pair ----
+process_crop_step9 <- function(crop_name) {
+
+  cat("\n----", toupper(crop_name), "----\n")
+
+  file_path <- file.path(data_dir, paste0("panelv7_", crop_name, ".xlsx"))
+  if (!file.exists(file_path)) {
+    cat("WARNING:", file_path, "not found, skipping this crop.\n")
+    return(NULL)
+  }
+  df <- read_excel(file_path) %>%
+    filter(complete.cases(select(., all_of(c("yield_hg_per_ha", feature_cols)))))
+
+  sel_crop <- selection %>% filter(crop == crop_name)
+  target_countries    <- sel_crop$country[sel_crop$role == "target"]
+  pool_countries       <- sel_crop$country[sel_crop$role == "pool"]
+  candidate_countries  <- sel_crop$country[sel_crop$role == "candidate"]
+
+  pool_data <- df %>% filter(Country_ISO %in% pool_countries)
+
+  results <- list()
+
+  for (t in target_countries) {
+
+    test_data <- df %>% filter(Country_ISO == t)
+    if (nrow(test_data) < 5) next
+    y_t <- log(test_data$yield_hg_per_ha)
+
+    # ---- baseline: predictions from a model trained on S only ----
+    f_S <- fit_lasso_predict(pool_data, test_data)
+    logme_S <- compute_logme(f_S, y_t)
+
+    for (s in candidate_countries) {
+
+      cand_data <- df %>% filter(Country_ISO == s)
+      if (nrow(cand_data) < 5) next
+
+      train_plus_s <- bind_rows(pool_data, cand_data)
+      f_Ss <- fit_lasso_predict(train_plus_s, test_data)
+      logme_Ss <- compute_logme(f_Ss, y_t)
+
+      results[[length(results) + 1]] <- data.frame(
+        crop      = crop_name,
+        target    = t,
+        candidate = s,
+        logme_S   = logme_S,
+        logme_Ss  = logme_Ss,
+        delta_logme = logme_Ss - logme_S   # positive = candidate improved evidence (helpful), matches NT sign convention
+      )
+    }
+    cat("  target", t, "done (", length(candidate_countries), "candidates )\n")
+  }
+
+  bind_rows(results)
+}
+
+# ---- Run for every crop ----
+logme_all <- bind_rows(lapply(crops_available, process_crop_step9))
+
+# ---- Join against Step 2's NT values ----
+combined <- logme_all %>%
+  left_join(nt_values, by = c("crop", "target", "candidate"))
+
+cat("\nTotal pairs with delta-LogME:", nrow(combined), "\n")
+
+# ---- Does delta-LogME predict NT? (Spearman correlation, same style as step 3) ----
+summary_tbl <- combined %>%
+  group_by(crop) %>%
+  summarise(
+    n_pairs                       = n(),
+    spearman_deltaLogME_vs_NT_lasso = cor(delta_logme, NT_lasso, method = "spearman"),
+    spearman_deltaLogME_vs_NT_xgb   = cor(delta_logme, NT_xgb,   method = "spearman"),
+    .groups = "drop"
+  )
+
+overall_row <- combined %>%
+  summarise(
+    crop = "ALL_CROPS_POOLED",
+    n_pairs = n(),
+    spearman_deltaLogME_vs_NT_lasso = cor(delta_logme, NT_lasso, method = "spearman"),
+    spearman_deltaLogME_vs_NT_xgb   = cor(delta_logme, NT_xgb,   method = "spearman")
+  )
+
+summary_tbl <- bind_rows(summary_tbl, overall_row)
+print(summary_tbl)
+
+# ---- AUROC: does delta-LogME rank-separate negative-transfer pairs from the rest? ----
+# (rank-based AUROC, same helper as previous steps, no extra package needed)
+auroc <- function(scores, labels) {
+  n1 <- sum(labels == 1); n0 <- sum(labels == 0)
+  if (n1 == 0 || n0 == 0) return(NA)
+  r <- rank(scores)
+  (sum(r[labels == 1]) - n1 * (n1 + 1) / 2) / (n1 * n0)
+}
+
+auroc_tbl <- data.frame(
+  nt_column = c("NT_lasso", "NT_xgb"),
+  auroc_deltaLogME = c(
+    auroc(combined$delta_logme, as.integer(combined$NT_lasso < 0)),
+    auroc(combined$delta_logme, as.integer(combined$NT_xgb   < 0))
+  )
+)
+print(auroc_tbl)
+
+# ---- Save everything as Excel (no RDS) ----
+out_path <- file.path(proj_dir, "negstep9_output.xlsx")
+
+wb <- createWorkbook()
+addWorksheet(wb, "pairwise_deltaLogME")     # every (target, candidate) row with delta-LogME and NT
+addWorksheet(wb, "spearman_by_crop")        # per-crop + overall Spearman correlation
+addWorksheet(wb, "auroc_summary")           # pooled AUROC: does delta-LogME rank-separate NT<0 pairs?
+
+writeData(wb, "pairwise_deltaLogME", combined)
+writeData(wb, "spearman_by_crop", summary_tbl)
+writeData(wb, "auroc_summary", auroc_tbl)
+
+saveWorkbook(wb, out_path, overwrite = TRUE)
+
+cat("\nStep 9 complete. Output saved to:\n", out_path, "\n")
+
+
+
+
+
+
