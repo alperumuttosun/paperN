@@ -1780,3 +1780,101 @@ saveWorkbook(wb, out_path, overwrite = TRUE)
 
 cat("\nStep 11 complete. Output saved to:\n", out_path, "\n")
 cat("Check the ALL_CROPS_POOLED rows across configs: stable pct_negative_lasso/xgb across N_pool and seed supports the headline prevalence claim; large swings would indicate strong pool-size/composition dependence.\n")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# =========================================================
+# negatifstep12.R
+# Negative Transfer pilot - Step 12: generate Figure A1 (the
+# Appendix A companion to Figure 2), using the exact same
+# crop-color / solid-vs-hollow style as Step 8. This was
+# previously produced outside the R pipeline (directly for the
+# manuscript) and had no corresponding script - this fills that
+# gap.
+#
+# Figure A1 shows leave-one-crop-out AUROC for the LogME-based
+# diagnostic (Step 10), by held-out crop: filled bar = LASSO-
+# based NT, hollow (outline-only) bar = XGBoost-based NT, each
+# crop in its own color (as in Table 1 / crop_colors).
+# No title/caption is drawn inside the plot - that goes in the
+# manuscript text, not the image. Saved as both PDF and PNG
+# (1600 dpi).
+# =========================================================
+
+library(readxl)   # read xlsx input
+library(dplyr)     # data manipulation
+library(ggplot2)   # plotting
+library(tidyr)      # pivot_wider
+
+# ---- 0. Folder paths (same convention as steps 1-11) ----
+data_dir <- "C:/Users/Alper.Tosun/Desktop/cru130"
+proj_dir <- file.path(data_dir, "negatif_transfer")
+fig_dir  <- file.path(proj_dir, "figures")
+if (!dir.exists(fig_dir)) dir.create(fig_dir, recursive = TRUE)
+
+# ---- 1. Load crop colors (fixed in step 1) and step-10's per-crop LOCO results ----
+crop_colors_df <- read_excel(file.path(proj_dir, "negstep1_output.xlsx"), sheet = "crop_colors")
+crop_order <- crop_colors_df$crop                                     # wheat, barley, oats, rye, rice, maize, soybean, sorghum
+crop_pal   <- setNames(crop_colors_df$color, crop_colors_df$crop)     # named vector: crop -> hex color
+
+step10 <- read_excel(file.path(proj_dir, "negstep10_output.xlsx"), sheet = "loco_per_crop")
+
+# ---- Helper: save a ggplot as both PDF and 1600 dpi PNG, no title/caption baked in ----
+save_figure <- function(gg, filename_stem, width_in = 7.5, height_in = 4.2) {
+  ggsave(file.path(fig_dir, paste0(filename_stem, ".pdf")), gg, width = width_in, height = height_in, device = "pdf")
+  ggsave(file.path(fig_dir, paste0(filename_stem, ".png")), gg, width = width_in, height = height_in, dpi = 1600)
+}
+
+# ---- Shared theme: clean, no plot title/caption/subtitle elements used anywhere ----
+base_theme <- theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.minor = element_blank(),
+    axis.title.x = element_blank(),
+    legend.title = element_blank(),
+    legend.position = "top"
+  )
+
+# =========================================================
+# Figure A1: leave-one-crop-out AUROC for delta-LogME, by crop
+# (data source: negstep10_output.xlsx, sheet "loco_per_crop")
+# =========================================================
+
+figA1_data <- step10 %>%
+  select(nt_column, held_out_crop, auroc) %>%
+  mutate(
+    crop    = factor(held_out_crop, levels = crop_order),               # fixed crop order (matches palette)
+    nt_type = ifelse(nt_column == "NT_lasso", "LASSO", "XGBoost"),      # readable labels
+    nt_type = factor(nt_type, levels = c("LASSO", "XGBoost"))
+  )
+
+figA1 <- ggplot(figA1_data, aes(x = crop, y = auroc, fill = crop, color = crop, alpha = nt_type)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6, linewidth = 0.9) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "black", linewidth = 0.4) +
+  scale_fill_manual(values = crop_pal, guide = "none") +     # fill color = crop's own color
+  scale_color_manual(values = crop_pal, guide = "none") +    # border color = crop's own color
+  # alpha trick: LASSO bars fully opaque fill (solid look), XGBoost bars fully transparent fill (hollow look, only border shows)
+  scale_alpha_manual(values = c("LASSO" = 1, "XGBoost" = 0), guide = "none") +
+  ylab("Leave-one-crop-out AUROC (\u0394LogME)") +
+  ylim(0, 0.75) +
+  base_theme
+
+save_figure(figA1, "figA1_logme_loco")
+
+cat("\nFigure A1 saved to:", fig_dir, "\n")
+cat("Reminder: filled bar = LASSO-based NT, hollow (outline-only) bar = XGBoost-based NT, per-crop color per Table 1 / crop_colors.\n")
+
+
