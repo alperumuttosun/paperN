@@ -1745,12 +1745,17 @@ for (i in seq_len(nrow(config_grid))) {
 
   crop_tbl <- bind_rows(crop_results)
   if (nrow(crop_tbl) > 0) {
+    # NOTE (bugfix): n_pairs must be summed LAST. dplyr::summarise() evaluates
+    # arguments sequentially within one call, so if n_pairs = sum(n_pairs) came
+    # before the weighted.mean() calls below, those calls would see the
+    # already-overwritten (length-1) n_pairs instead of the original per-crop
+    # vector, causing a "'x' and 'w' must have the same length" error.
     overall <- crop_tbl %>%
       summarise(
         crop = "ALL_CROPS_POOLED",
-        n_pairs = sum(n_pairs),
         pct_negative_lasso = weighted.mean(pct_negative_lasso, n_pairs, na.rm = TRUE),
-        pct_negative_xgb    = if (RUN_XGB) weighted.mean(pct_negative_xgb, n_pairs, na.rm = TRUE) else NA
+        pct_negative_xgb    = if (RUN_XGB) weighted.mean(pct_negative_xgb, n_pairs, na.rm = TRUE) else NA,
+        n_pairs = sum(n_pairs)
       )
     crop_tbl <- bind_rows(crop_tbl, overall)
   }
