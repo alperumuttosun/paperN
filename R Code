@@ -1002,8 +1002,21 @@ run_loco <- function(nt_col) {
     pred <- predict(model, x_all[test_idx, ])
     oof_pred[test_idx] <- pred
 
+    # DIAGNOSTIC ADDITION (per external review): record each held-out crop's
+    # label prevalence and out-of-fold score distribution. Under crop-
+    # stratified permutation, the null distribution of the POOLED AUROC is
+    # only guaranteed to center on 0.5 if crops are exchangeable in both (a)
+    # NT<0 prevalence and (b) the distribution of oof_pred scores. If crops
+    # differ materially on either, pooling ranks across crops can shift the
+    # null mean away from 0.5 - a known property of pooled/marginal AUROC
+    # under within-stratum permutation (related to Simpson's-paradox-type
+    # aggregation bias), not necessarily a computation error. This table lets
+    # us check whether that is what is happening here, without changing the
+    # permutation procedure itself.
     per_crop[[held_out]] <- data.frame(
       nt_column = nt_col, held_out_crop = held_out, n_test = length(test_idx),
+      prevalence = mean(y_all[test_idx]),
+      pred_mean = mean(pred), pred_sd = sd(pred),
       auroc = auroc(pred, y_all[test_idx]), pr_auc = pr_auc(pred, y_all[test_idx])
     )
   }
@@ -1033,7 +1046,8 @@ permutation_test <- function(oof_pred, y_all, crop_vec, n_perm = 500) {
     perm_stats[p] <- auroc(oof_pred, y_perm)
   }
   p_value <- mean(abs(perm_stats - 0.5) >= abs(observed - 0.5))   # two-sided
-  list(observed = observed, p_value = p_value, perm_mean = mean(perm_stats), perm_sd = sd(perm_stats))
+  list(observed = observed, p_value = p_value, perm_mean = mean(perm_stats), perm_sd = sd(perm_stats),
+       perm_stats = perm_stats)   # DIAGNOSTIC ADDITION: keep the full null distribution, not just its mean/sd
 }
 
 # ---- Run everything ----
@@ -1056,22 +1070,50 @@ cat("\n--- Permutation test summary ---\n")
 print(summary_tbl)
 
 per_crop_all <- bind_rows(res_lasso$per_crop, res_xgb$per_crop)
+cat("\n--- DIAGNOSTIC: per-crop prevalence and score distribution ---\n")
+print(per_crop_all)
+
+# DIAGNOSTIC ADDITION: overall (pooled, unconditional) label prevalence and
+# score summary, for comparison against the per-crop table above - if the
+# per-crop rows vary a lot around these pooled numbers, that heterogeneity
+# is the likely explanation for an off-center permutation null.
+diagnostic_overall <- bind_rows(
+  data.frame(nt_column = "NT_lasso", pooled_prevalence = mean(res_lasso$y_all),
+             pooled_pred_mean = mean(res_lasso$oof_pred), pooled_pred_sd = sd(res_lasso$oof_pred)),
+  data.frame(nt_column = "NT_xgb", pooled_prevalence = mean(res_xgb$y_all),
+             pooled_pred_mean = mean(res_xgb$oof_pred), pooled_pred_sd = sd(res_xgb$oof_pred))
+)
+
+# DIAGNOSTIC ADDITION: save the full null distribution (500 permuted AUROC
+# values) for each NT definition, so its shape (not just mean/sd) can be
+# inspected - e.g., plotted as a histogram - to check for anything unusual
+# beyond simple off-centering (skew, multimodality, etc.).
+null_distributions <- data.frame(
+  permutation_index = 1:500,
+  NT_lasso_null_auroc = perm_lasso$perm_stats,
+  NT_xgb_null_auroc   = perm_xgb$perm_stats
+)
 
 # ---- Save everything as Excel (no RDS) ----
 out_path <- file.path(proj_dir, "negstep7_output.xlsx")
 
 wb <- createWorkbook()
 addWorksheet(wb, "permutation_summary")   # observed AUROC vs. null distribution, p-value
-addWorksheet(wb, "loco_per_crop_oracle")  # per-crop LOCO AUROC/PR-AUC with the oracle feature set
+addWorksheet(wb, "loco_per_crop_oracle")  # per-crop LOCO AUROC/PR-AUC with the oracle feature set, now with prevalence + score distribution
 addWorksheet(wb, "oracle_feature_table")  # the oracle feature matrix used
+addWorksheet(wb, "diagnostic_overall")    # DIAGNOSTIC ADDITION: pooled prevalence/score summary for comparison
+addWorksheet(wb, "null_distributions")    # DIAGNOSTIC ADDITION: all 500 permuted AUROC values per NT definition
 
 writeData(wb, "permutation_summary", summary_tbl)
 writeData(wb, "loco_per_crop_oracle", per_crop_all)
 writeData(wb, "oracle_feature_table", feat_full)
+writeData(wb, "diagnostic_overall", diagnostic_overall)
+writeData(wb, "null_distributions", null_distributions)
 
 saveWorkbook(wb, out_path, overwrite = TRUE)
 
 cat("\nStep 7 complete. Output saved to:\n", out_path, "\n")
+cat("New diagnostic sheets: loco_per_crop_oracle (now includes prevalence/pred_mean/pred_sd), diagnostic_overall, null_distributions.\n")
 
 
 # =========================================================
@@ -1780,7 +1822,6 @@ saveWorkbook(wb, out_path, overwrite = TRUE)
 
 cat("\nStep 11 complete. Output saved to:\n", out_path, "\n")
 cat("Check the ALL_CROPS_POOLED rows across configs: stable pct_negative_lasso/xgb across N_pool and seed supports the headline prevalence claim; large swings would indicate strong pool-size/composition dependence.\n")
-
 
 
 
