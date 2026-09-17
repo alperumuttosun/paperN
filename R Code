@@ -588,35 +588,49 @@ pr_auc <- function(scores, labels) {
 # ---- Function: 5-fold CV for one NT column, return out-of-fold AUROC and PR-AUC ----
 # for both the nonlinear (XGBoost) model and a simple linear (logistic) baseline.
 #
-# CORRECTED AFTER REVIEW: the original version used a RANDOM row-level fold
-# split. Because many rows share the same target country (every candidate
-# paired with that target) or the same candidate country (paired with many
-# targets), random splitting can put highly similar rows - sharing the same
-# target's "prediction environment" - into both the training and test fold.
-# A classifier can then partly learn target-specific or candidate-specific
-# patterns rather than a genuinely generalizable structure, which would
-# inflate AUROC relative to what a truly new (target, candidate) pair would
-# achieve. We now use TARGET-GROUPED folds: all rows sharing the same
-# (crop, target) pair are assigned to the same fold, so no fold boundary
-# ever splits a single target's pairs. Since every crop has exactly 5
-# targets, this maps naturally onto a 5-fold split. The old random-fold
-# result is also computed and reported alongside, so the two can be
-# compared directly.
+# CORRECTED AFTER REVIEW (round 1): the original version used a RANDOM
+# row-level fold split. Because many rows share the same target country
+# (every candidate paired with that target) or the same candidate country
+# (paired with many targets), random splitting can put highly similar rows
+# into both the training and test fold, inflating apparent AUROC.
 #
-# grouping = "random" (old, row-level) or "target" (new, grouped by target)
-run_cv <- function(nt_col, x_all, grouping = c("target", "random"), include_nobs = FALSE) {
+# CORRECTED AGAIN AFTER REVIEW (round 2): the first correction grouped folds
+# by (crop, target) - e.g., "wheat_TUR" and "maize_TUR" were treated as two
+# DIFFERENT groups. But the same country is sometimes selected as a target
+# in more than one crop (empirically: 8 of 40 target slots, 11 slots overall,
+# representing repeats among only 29 distinct countries out of 40 slots).
+# Under (crop, target) grouping, a country like Turkey could appear as a
+# target in the training fold via one crop (e.g., maize) while also
+# appearing as a target in the test fold via a different crop (e.g., wheat).
+# Since crop identity is itself a model feature, this is a real, if
+# narrower, country-level leakage channel that (crop, target) grouping does
+# NOT close. We now additionally support COUNTRY-level grouping - every row
+# for a given target country, across ALL crops in which it is ever a
+# target, is assigned to the same fold - which fully closes this channel.
+# All three grouping schemes are computed and reported side by side so the
+# effect of each correction can be seen directly.
+#
+# grouping = "random" (original, row-level) | "crop_target" (round-1 fix,
+# grouped by (crop, target) pair) | "country" (round-2 fix, grouped by
+# target country alone, closing the cross-crop repeat-target channel)
+run_cv <- function(nt_col, x_all, grouping = c("country", "crop_target", "random"), include_nobs = FALSE) {
   grouping <- match.arg(grouping)
 
   y <- as.integer(feat[[nt_col]] < 0)     # 1 = negative transfer, 0 = not
   n <- nrow(feat)
 
-  if (grouping == "target") {
-    target_id <- paste(feat$crop, feat$target, sep = "_")            # unique (crop, target) group id
-    unique_groups <- unique(target_id)
+  if (grouping == "country") {
+    group_id <- feat$target                                           # group by country alone, ignoring which crop
+    unique_groups <- unique(group_id)
     group_fold <- setNames(sample(rep(1:5, length.out = length(unique_groups))), unique_groups)
-    folds <- group_fold[target_id]                                    # every row inherits its target's fold
+    folds <- group_fold[group_id]
+  } else if (grouping == "crop_target") {
+    group_id <- paste(feat$crop, feat$target, sep = "_")              # unique (crop, target) group id
+    unique_groups <- unique(group_id)
+    group_fold <- setNames(sample(rep(1:5, length.out = length(unique_groups))), unique_groups)
+    folds <- group_fold[group_id]                                     # every row inherits its (crop,target) group's fold
   } else {
-    folds <- sample(rep(1:5, length.out = n))                         # old behavior: random row-level split
+    folds <- sample(rep(1:5, length.out = n))                         # original behavior: random row-level split
   }
 
   oof_xgb    <- numeric(n)   # out-of-fold predicted probability, XGBoost
@@ -662,33 +676,51 @@ x_base <- cbind(x_dist, crop_dummies)   # distance features + crop dummies (orig
 # than a small one) rather than genuine climatic/economic incompatibility.
 x_nobs <- cbind(x_base, n_obs_candidate = feat$n_obs_candidate, n_obs_target = feat$n_obs_target)
 
-# ---- Run all four combinations: {target-grouped, random} x {base, +nobs} ----
-# Grouped CV is the corrected, primary result; random CV is kept only for
-# direct before/after comparison with the original (uncorrected) design.
+# ---- Run all combinations: {country, crop_target, random} x {base, +nobs} ----
+# Country-level grouping is now the corrected, primary result. crop_target
+# (round-1 fix) and random (original) are kept for direct, three-way
+# before/after comparison with the original (uncorrected) design.
 results_all <- bind_rows(
-  run_cv("NT_lasso", x_base, grouping = "target", include_nobs = FALSE),
-  run_cv("NT_xgb",   x_base, grouping = "target", include_nobs = FALSE),
-  run_cv("NT_lasso", x_base, grouping = "random", include_nobs = FALSE),
-  run_cv("NT_xgb",   x_base, grouping = "random", include_nobs = FALSE),
-  run_cv("NT_lasso", x_nobs, grouping = "target", include_nobs = TRUE),
-  run_cv("NT_xgb",   x_nobs, grouping = "target", include_nobs = TRUE)
+  run_cv("NT_lasso", x_base, grouping = "country",     include_nobs = FALSE),
+  run_cv("NT_xgb",   x_base, grouping = "country",     include_nobs = FALSE),
+  run_cv("NT_lasso", x_base, grouping = "crop_target", include_nobs = FALSE),
+  run_cv("NT_xgb",   x_base, grouping = "crop_target", include_nobs = FALSE),
+  run_cv("NT_lasso", x_base, grouping = "random",      include_nobs = FALSE),
+  run_cv("NT_xgb",   x_base, grouping = "random",      include_nobs = FALSE),
+  run_cv("NT_lasso", x_nobs, grouping = "country",     include_nobs = TRUE),
+  run_cv("NT_xgb",   x_nobs, grouping = "country",     include_nobs = TRUE)
 )
 print(results_all)
+
+# DIAGNOSTIC ADDITION: report how many target slots / distinct countries are
+# involved in the cross-crop repeat-target issue that motivated the country-
+# level grouping fix, so this is documented alongside the corrected results.
+target_slots <- feat %>% distinct(crop, target)
+repeat_summary <- target_slots %>%
+  count(target, name = "n_crops_as_target") %>%
+  filter(n_crops_as_target > 1)
+cat("\n--- DIAGNOSTIC: countries selected as target in more than one crop ---\n")
+cat("Total target slots (crop, target):", nrow(target_slots), "\n")
+cat("Distinct countries among those slots:", n_distinct(target_slots$target), "\n")
+cat("Countries repeating as target across crops:", nrow(repeat_summary), "\n")
+print(repeat_summary)
 
 # ---- Save everything as Excel (no RDS) ----
 out_path <- file.path(proj_dir, "negstep4_output.xlsx")
 
 wb <- createWorkbook()
-addWorksheet(wb, "cv_results")     # AUROC / PR-AUC for every {grouping x nobs} combination, for each NT definition
-addWorksheet(wb, "feature_table")  # the feature matrix used (for inspection / reuse)
+addWorksheet(wb, "cv_results")           # AUROC / PR-AUC for every {grouping x nobs} combination, for each NT definition
+addWorksheet(wb, "feature_table")        # the feature matrix used (for inspection / reuse)
+addWorksheet(wb, "repeat_target_countries")  # DIAGNOSTIC: countries selected as target in >1 crop
 
 writeData(wb, "cv_results", results_all)
 writeData(wb, "feature_table", feat)
+writeData(wb, "repeat_target_countries", repeat_summary)
 
 saveWorkbook(wb, out_path, overwrite = TRUE)
 
 cat("\nStep 4 complete. Output saved to:\n", out_path, "\n")
-cat("Compare cv_grouping == \"target\" (corrected) vs \"random\" (original) rows to see the effect of grouped CV.\n")
+cat("Compare cv_grouping == \"country\" (fully corrected) vs \"crop_target\" (round-1 fix, still has cross-crop leakage) vs \"random\" (original) rows to see the effect of each correction.\n")
 
 
 
@@ -1822,9 +1854,6 @@ saveWorkbook(wb, out_path, overwrite = TRUE)
 
 cat("\nStep 11 complete. Output saved to:\n", out_path, "\n")
 cat("Check the ALL_CROPS_POOLED rows across configs: stable pct_negative_lasso/xgb across N_pool and seed supports the headline prevalence claim; large swings would indicate strong pool-size/composition dependence.\n")
-
-
-
 
 
 
