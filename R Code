@@ -1066,6 +1066,21 @@ run_loco <- function(nt_col) {
 # crop's true negative-transfer rate and the crop grouping structure, so
 # that only 8 crops (rather than thousands of non-independent pairs) are
 # implicitly treated as the independent unit.
+# CORRECTED AFTER REVIEW: the original two-sided p-value compared each
+# quantity's distance from the FIXED point 0.5 - i.e., it tested "how far
+# from 0.5 is the observed AUROC, compared to how far from 0.5 permuted
+# AUROCs get" - rather than the standard permutation-test question, "how
+# extreme is the observed statistic relative to the null distribution's OWN
+# realized values." These coincide only when the null distribution happens
+# to be centered at 0.5. When it is not (Section 3.5 documents exactly this,
+# with an NT_xgb null mean of 0.471 rather than 0.5), the old formula can
+# give a badly misleading p-value - in our case, changing "not distinguishable
+# from chance" into "distinguishable from chance" once corrected. We now
+# compute the p-value from each permuted statistic's distance from the
+# null distribution's own mean, with the standard +1/+1 continuity
+# correction (Davison & Hinkley, 1997) so that a zero-exceedance result is
+# reported as "< 1/(n_perm+1)" rather than an unjustified p = 0. We keep the
+# old, uncorrected p-value alongside the new one for direct comparison.
 permutation_test <- function(oof_pred, y_all, crop_vec, n_perm = 500) {
   observed <- auroc(oof_pred, y_all)
   perm_stats <- numeric(n_perm)
@@ -1077,9 +1092,13 @@ permutation_test <- function(oof_pred, y_all, crop_vec, n_perm = 500) {
     }
     perm_stats[p] <- auroc(oof_pred, y_perm)
   }
-  p_value <- mean(abs(perm_stats - 0.5) >= abs(observed - 0.5))   # two-sided
-  list(observed = observed, p_value = p_value, perm_mean = mean(perm_stats), perm_sd = sd(perm_stats),
-       perm_stats = perm_stats)   # DIAGNOSTIC ADDITION: keep the full null distribution, not just its mean/sd
+  null_mean <- mean(perm_stats)
+  p_value_old_uncorrected <- mean(abs(perm_stats - 0.5) >= abs(observed - 0.5))            # ORIGINAL (flawed) formula, kept for comparison only
+  exceed <- sum(abs(perm_stats - null_mean) >= abs(observed - null_mean))
+  p_value <- (exceed + 1) / (n_perm + 1)                                                    # CORRECTED formula: distance from the null's own mean, continuity-corrected
+  list(observed = observed, p_value = p_value, p_value_old_uncorrected = p_value_old_uncorrected,
+       perm_mean = null_mean, perm_sd = sd(perm_stats),
+       perm_stats = perm_stats)   # keep the full null distribution, not just its mean/sd
 }
 
 # ---- Run everything ----
@@ -1092,13 +1111,15 @@ perm_xgb   <- permutation_test(res_xgb$oof_pred,   res_xgb$y_all,   feat_full$cr
 summary_tbl <- bind_rows(
   data.frame(nt_column = "NT_lasso", observed_auroc = perm_lasso$observed,
              permutation_p_value = perm_lasso$p_value,
+             permutation_p_value_OLD_uncorrected = perm_lasso$p_value_old_uncorrected,
              null_mean = perm_lasso$perm_mean, null_sd = perm_lasso$perm_sd),
   data.frame(nt_column = "NT_xgb", observed_auroc = perm_xgb$observed,
              permutation_p_value = perm_xgb$p_value,
+             permutation_p_value_OLD_uncorrected = perm_xgb$p_value_old_uncorrected,
              null_mean = perm_xgb$perm_mean, null_sd = perm_xgb$perm_sd)
 )
 
-cat("\n--- Permutation test summary ---\n")
+cat("\n--- Permutation test summary (permutation_p_value is the CORRECTED formula; permutation_p_value_OLD_uncorrected is the original, flawed formula, kept only for comparison) ---\n")
 print(summary_tbl)
 
 per_crop_all <- bind_rows(res_lasso$per_crop, res_xgb$per_crop)
@@ -1583,6 +1604,15 @@ run_loco <- function(nt_col) {
 }
 
 # ---- Permutation test (stratified by crop) - identical protocol to step 7 ----
+# CORRECTED AFTER REVIEW: same fix as Step 7's permutation_test() - the
+# p-value is now computed from each permuted statistic's distance from the
+# null distribution's OWN mean (continuity-corrected), not from a fixed
+# distance-from-0.5 comparison, which is only valid when the null happens
+# to be centered at 0.5. The old, uncorrected p-value is kept alongside for
+# comparison. Step 10's null means (~0.50, ~0.498, per the original run)
+# are already close to 0.5, so this correction is expected to have little
+# numerical effect here - unlike in Step 7 - but we apply it for
+# consistency and to confirm that expectation rather than assume it.
 permutation_test <- function(oof_pred, y_all, crop_vec, n_perm = 500) {
   observed <- auroc(oof_pred, y_all)
   perm_stats <- numeric(n_perm)
@@ -1594,8 +1624,12 @@ permutation_test <- function(oof_pred, y_all, crop_vec, n_perm = 500) {
     }
     perm_stats[p] <- auroc(oof_pred, y_perm)
   }
-  p_value <- mean(abs(perm_stats - 0.5) >= abs(observed - 0.5))
-  list(observed = observed, p_value = p_value, perm_mean = mean(perm_stats), perm_sd = sd(perm_stats))
+  null_mean <- mean(perm_stats)
+  p_value_old_uncorrected <- mean(abs(perm_stats - 0.5) >= abs(observed - 0.5))
+  exceed <- sum(abs(perm_stats - null_mean) >= abs(observed - null_mean))
+  p_value <- (exceed + 1) / (n_perm + 1)
+  list(observed = observed, p_value = p_value, p_value_old_uncorrected = p_value_old_uncorrected,
+       perm_mean = null_mean, perm_sd = sd(perm_stats), perm_stats = perm_stats)
 }
 
 # ---- Run everything ----
@@ -1608,28 +1642,40 @@ perm_xgb   <- permutation_test(res_xgb$oof_pred,   res_xgb$y_all,   feat$crop)
 summary_tbl <- bind_rows(
   data.frame(nt_column = "NT_lasso", observed_auroc = perm_lasso$observed,
              permutation_p_value = perm_lasso$p_value,
+             permutation_p_value_OLD_uncorrected = perm_lasso$p_value_old_uncorrected,
              null_mean = perm_lasso$perm_mean, null_sd = perm_lasso$perm_sd),
   data.frame(nt_column = "NT_xgb", observed_auroc = perm_xgb$observed,
              permutation_p_value = perm_xgb$p_value,
+             permutation_p_value_OLD_uncorrected = perm_xgb$p_value_old_uncorrected,
              null_mean = perm_xgb$perm_mean, null_sd = perm_xgb$perm_sd)
 )
 
-cat("\n--- delta-LogME: LOCO permutation test summary ---\n")
+cat("\n--- delta-LogME: LOCO permutation test summary (permutation_p_value is CORRECTED; permutation_p_value_OLD_uncorrected is the original, flawed formula) ---\n")
 print(summary_tbl)
 
 per_crop_all <- bind_rows(res_lasso$per_crop, res_xgb$per_crop)
 cat("\n--- delta-LogME: per-crop LOCO results ---\n")
 print(per_crop_all)
 
+# DIAGNOSTIC ADDITION (matching Step 7): save the full null distribution so
+# its shape can be inspected directly, not just its mean/sd.
+null_distributions <- data.frame(
+  permutation_index = 1:500,
+  NT_lasso_null_auroc = perm_lasso$perm_stats,
+  NT_xgb_null_auroc   = perm_xgb$perm_stats
+)
+
 # ---- Save everything as Excel (no RDS) ----
 out_path <- file.path(proj_dir, "negstep10_output.xlsx")
 
 wb <- createWorkbook()
-addWorksheet(wb, "permutation_summary")   # observed AUROC vs. null distribution, p-value
+addWorksheet(wb, "permutation_summary")   # observed AUROC vs. null distribution, p-value (both corrected and old)
 addWorksheet(wb, "loco_per_crop")         # per-crop LOCO AUROC/PR-AUC for delta_logme
+addWorksheet(wb, "null_distributions")    # DIAGNOSTIC ADDITION: all 500 permuted AUROC values per NT definition
 
 writeData(wb, "permutation_summary", summary_tbl)
 writeData(wb, "loco_per_crop", per_crop_all)
+writeData(wb, "null_distributions", null_distributions)
 
 saveWorkbook(wb, out_path, overwrite = TRUE)
 
@@ -1854,9 +1900,6 @@ saveWorkbook(wb, out_path, overwrite = TRUE)
 
 cat("\nStep 11 complete. Output saved to:\n", out_path, "\n")
 cat("Check the ALL_CROPS_POOLED rows across configs: stable pct_negative_lasso/xgb across N_pool and seed supports the headline prevalence claim; large swings would indicate strong pool-size/composition dependence.\n")
-
-
-
 
 
 
