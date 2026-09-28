@@ -1,489 +1,1902 @@
-# =============================================================================
-# network_pipeline.R
-# Crop-country transferability network paper -- full analysis pipeline
-# -----------------------------------------------------------------------------
-# Step 1  Negative-transfer (NT) computation, 8 crops x R=5 pool draws   [HEAVY, ~19 h]
-# Step 2  Community detection + null model 1 + ARI/NMI vs climate/GDP clusters
-# Step 3  Mechanism analysis (source/target signatures, partial correlation)
-# Step 4  Eta-squared: GDP vs climate, with 5-seed stability check
-# Step 5  Pool-size sensitivity pilot (pool 10/15/20; wheat, rye, sorghum) [HEAVY, ~4 h]
-# Step 6  Community-assignment stability across R (ARI/NMI, R=1 and R=3 vs R=5)
-# Step 7  Null model 2 (degree-preserving topology randomization)
-# Step 8  Diagnostics: pair-count audit, prevalence by R, XGB/LASSO dispersion, yield skew
-# Step 9  Figures 1 and 2
-# -----------------------------------------------------------------------------
-# HOW TO USE: run the whole file. Heavy steps 1 and 5 are skipped automatically if
-# their output already exists; set RUN["step5"] <- FALSE below to skip Step 5 for now.
-# Steps run in the order set by RUN_ORDER (the heavy Step 5 is placed last).
-# =============================================================================
+# =========================================================
+# negatif_full.R
+# Negative Transfer pilot - FULL PIPELINE (Steps 1-7, combined)
+# Step 6 is retired (see note before the old Step 7 section).
+# Run this single file top to bottom. Each step still writes
+# its own Excel output to negatif_transfer/, exactly as before,
+# so intermediate results remain inspectable at every stage.
+# =========================================================
 
-# ---- 0) Libraries ----
-suppressPackageStartupMessages({
-  library(readxl)    # read the Excel panels
-  library(dplyr)     # data wrangling
-  library(tidyr)     # pivot_longer for Step 9
-  library(igraph)    # graphs, Louvain community detection
-  library(writexl)   # write Excel outputs
-})
+# =========================================================
+# negatifstep1.R
+# Negative Transfer pilot - Step 1: data preparation and
+# selection of target / pool / candidate countries
+# Runs for ALL crops (wheat, barley, oats, rye, rice,
+# maize, soybean, sorghum)
+# =========================================================
 
-# ---- 1) Paths: first existing folder wins (main machine, then fallback machine) ----
-candidate_dirs <- c("C:/Users/Alper.Tosun/Desktop/cru130",
-                    "C:/Users/autos/OneDrive/Desktop/cru130")
-base_dir <- candidate_dirs[dir.exists(candidate_dirs)][1]                  # pick the first that exists
-if (is.na(base_dir)) stop("None of the folders in 'candidate_dirs' exists.")  # stop early with a clear message
-setwd(base_dir)                                                            # work from the panel folder
-out_dir <- file.path(base_dir, "network_paper")                            # all outputs go here
-fig_dir <- file.path(out_dir, "figures")                                   # figures go here
-dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)                # create if missing
-dir.create(fig_dir, showWarnings = FALSE, recursive = TRUE)                # create if missing
-out_file <- function(name) file.path(out_dir, name)                        # short helper for output paths
-cat("Base folder:", base_dir, "\n")
+library(readxl)    # to read xlsx input files
+library(openxlsx)  # to write xlsx output files
+library(dplyr)      # data manipulation
 
-# ---- 2) Switches ----
-RUN <- c(step1 = TRUE, step2 = TRUE, step3 = TRUE, step4 = TRUE, step5 = TRUE,
-         step6 = TRUE, step7 = TRUE, step8 = TRUE, step9 = TRUE)           # set a step to FALSE to skip it
-SKIP_IF_DONE <- c(step1 = TRUE, step5 = TRUE)                              # heavy steps: skip if output already exists
-RUN_ORDER <- c(1, 2, 3, 4, 6, 7, 8, 9, 5)                                  # fast steps first, heavy Step 5 last
+set.seed(42)   # fixes all randomness so results are reproducible
 
-# ---- 3) Design parameters (same as the main paper) ----
-crops      <- c("wheat", "barley", "oats", "rye", "rice", "maize", "soybean", "sorghum")
-all_crops  <- c("wheat", "barley", "oats", "rye", "rice", "maize", "soybean", "sorghum")  # fixed order, used for seeds
-feats      <- c("TMX_ann", "PRE_ann", "GDP_per_Capita")                    # predictors
-y_col      <- "yield_hg_per_ha"                                            # yield column
-pool_size  <- 15                                                           # background pool size |S|
-n_repeats  <- 5                                                            # independent pool draws R
-n_star     <- 30                                                           # observations sampled per country
-min_obs    <- 30                                                           # eligibility threshold
-n_null     <- 500                                                          # null-model draws (30 was too coarse: p resolution 1/30)
-metrics    <- c("NT_lasso", "NT_xgb")                                      # the two NT series
-seed_index <- function(crop) match(crop, all_crops)                        # stable crop index for seeds
-
-crop_colors <- c(wheat = "#08519C", barley = "#3182BD", oats = "#6BAED6", rye = "#9ECAE1",
-                 rice = "#A63603", maize = "#E6550D", soybean = "#FD8D3C", sorghum = "#FDBE85")
-
-# ---- 4) Shared helpers ----
-step1_file <- out_file("networkstep1_output.xlsx")                         # main NT table (Step 1 output)
-
-read_step1 <- function() {                                                 # load Step 1 output or stop with a hint
-  if (!file.exists(step1_file)) stop("networkstep1_output.xlsx not found -- run Step 1 first.")
-  read_excel(step1_file)
+# ---- 0. Folder paths ----
+data_dir <- "C:/Users/Alper.Tosun/Desktop/cru130"             # folder containing all panelv7_<crop>.xlsx files
+proj_dir <- file.path(data_dir, "negatif_transfer")           # subfolder where this pilot's outputs are saved
+if (!dir.exists(proj_dir)) {
+  dir.create(proj_dir, recursive = TRUE)   # create the folder if it doesn't exist yet
+  cat("Folder created:", proj_dir, "\n")
 }
 
-read_panel <- function(crop_name) {                                        # raw panel for one crop
-  read_excel(file.path(base_dir, paste0("panelv7_", crop_name, ".xlsx")))
-}
+# ---- Crop color palette (fixed now for later plots) ----
+crop_colors <- c(
+  wheat   = "#08519C",
+  barley  = "#3182BD",
+  oats    = "#6BAED6",
+  rye     = "#9ECAE1",
+  rice    = "#A63603",
+  maize   = "#E6550D",
+  soybean = "#FD8D3C",
+  sorghum = "#FDBE85"
+)
+crop_colors_df <- data.frame(crop = names(crop_colors), color = unname(crop_colors))  # turn palette into a table for saving
 
-prep_panel <- function(crop_name) {                                        # eligibility + fixed n* subsample + drop NAs
-  df <- read_panel(crop_name)
-  counts <- df %>% count(Country_ISO)                                      # observations per country
-  eligible <- counts$Country_ISO[counts$n >= min_obs]                      # countries with enough years
-  df %>%
-    filter(Country_ISO %in% eligible) %>%
+crops <- names(crop_colors)   # the 8 crops to process
+
+# ---- Function that runs step-1 selection for a single crop ----
+process_crop <- function(crop_name) {
+  
+  file_path <- file.path(data_dir, paste0("panelv7_", crop_name, ".xlsx"))  # e.g. panelv7_wheat.xlsx
+  
+  if (!file.exists(file_path)) {
+    cat("WARNING:", file_path, "not found, skipping this crop.\n")
+    return(NULL)
+  }
+  
+  cat("\n----", toupper(crop_name), "----\n")
+  
+  df <- read_excel(file_path)   # raw country-year panel
+  
+  # ---- Apply minimum observation threshold (>=30) ----
+  obs_count <- df %>%
     group_by(Country_ISO) %>%
-    slice_sample(n = n_star) %>%                                           # fixed n* observations per country
-    ungroup() %>%
-    filter(if_all(all_of(c(feats, y_col)), ~ !is.na(.)))                   # drop rows with missing values
+    summarise(n_obs = sum(!is.na(yield_hg_per_ha)), .groups = "drop")   # valid observation count per country
+  
+  eligible_countries <- obs_count %>%
+    filter(n_obs >= 30) %>%       # threshold: 30 observations
+    pull(Country_ISO)
+  
+  cat("Eligible countries (>=30 obs):", length(eligible_countries), "\n")
+  
+  df_elig <- df %>% filter(Country_ISO %in% eligible_countries)   # keep only eligible countries
+  
+  # ---- Build climate fingerprint (one row per country) ----
+  fingerprint <- df_elig %>%
+    group_by(Country_ISO) %>%
+    summarise(
+      mean_TMX = mean(TMX_ann, na.rm = TRUE),         # mean max temperature
+      sd_TMX   = sd(TMX_ann,   na.rm = TRUE),         # temperature variability
+      mean_PRE = mean(PRE_ann, na.rm = TRUE),         # mean precipitation
+      sd_PRE   = sd(PRE_ann,   na.rm = TRUE),         # precipitation variability
+      mean_GDP = mean(GDP_per_Capita, na.rm = TRUE),  # mean GDP per capita
+      .groups = "drop"
+    ) %>%
+    filter(complete.cases(.))   # drop countries with any missing fingerprint value
+  
+  cat("Countries with a fingerprint:", nrow(fingerprint), "\n")
+  
+  # ---- K-means: pick 5 target countries (closest country to each cluster centroid) ----
+  fp_scaled <- scale(fingerprint[, c("mean_TMX","sd_TMX","mean_PRE","sd_PRE","mean_GDP")])  # standardize (units differ)
+  km <- kmeans(fp_scaled, centers = 5, nstart = 25)   # 5 climate clusters, best of 25 random starts
+  
+  target_countries <- character(5)
+  for (k in 1:5) {
+    idx_in_cluster <- which(km$cluster == k)                       # row indices of countries in this cluster
+    centroid <- km$centers[k, ]                                    # cluster centroid
+    dists <- apply(fp_scaled[idx_in_cluster, , drop = FALSE], 1,
+                   function(row) sqrt(sum((row - centroid)^2)))    # Euclidean distance to centroid
+    closest <- idx_in_cluster[which.min(dists)]                    # country closest to the centroid
+    target_countries[k] <- fingerprint$Country_ISO[closest]
+  }
+  
+  cat("Selected 5 target countries:", paste(target_countries, collapse = ", "), "\n")
+  
+  # ---- Fixed source pool S (N=20) - stratified random sample from non-target countries ----
+  pool_candidates_fp <- fingerprint %>% filter(!Country_ISO %in% target_countries)
+  pool_clusters <- km$cluster[match(pool_candidates_fp$Country_ISO, fingerprint$Country_ISO)]
+  
+  pool_countries <- character(0)
+  n_per_cluster <- round(20 * table(pool_clusters) / length(pool_clusters))   # proportional allocation per cluster
+  
+  for (k in unique(pool_clusters)) {
+    cluster_pool <- pool_candidates_fp$Country_ISO[pool_clusters == k]
+    n_take <- min(n_per_cluster[as.character(k)], length(cluster_pool))
+    pool_countries <- c(pool_countries, sample(cluster_pool, n_take))   # reproducible thanks to seed=42
+  }
+  
+  # fix rounding errors so the pool is exactly 20 countries
+  if (length(pool_countries) > 20) {
+    pool_countries <- sample(pool_countries, 20)
+  } else if (length(pool_countries) < 20) {
+    remaining <- setdiff(pool_candidates_fp$Country_ISO, pool_countries)
+    extra <- sample(remaining, 20 - length(pool_countries))
+    pool_countries <- c(pool_countries, extra)
+  }
+  
+  cat("Fixed source pool (N=20):", paste(pool_countries, collapse = ", "), "\n")
+  
+  # ---- Candidate source countries: everyone outside pool + target ----
+  candidate_countries <- fingerprint$Country_ISO[
+    !fingerprint$Country_ISO %in% c(target_countries, pool_countries)
+  ]
+  
+  cat("Number of candidate source countries:", length(candidate_countries), "\n")
+  
+  # ---- Build small summary tables for this crop (to be combined across crops later) ----
+  selection_tbl <- bind_rows(
+    data.frame(crop = crop_name, country = target_countries,    role = "target"),
+    data.frame(crop = crop_name, country = pool_countries,      role = "pool"),
+    data.frame(crop = crop_name, country = candidate_countries, role = "candidate")
+  )
+  
+  fingerprint_tbl <- fingerprint %>% mutate(crop = crop_name, .before = 1)   # add crop column for stacking
+  
+  list(selection = selection_tbl, fingerprint = fingerprint_tbl)
 }
 
-fit_and_rmse <- function(train_df, test_df) {                              # fit LASSO + XGBoost, return held-out RMSE
-  X_tr <- as.matrix(train_df[, feats]); y_tr <- train_df[[y_col]]          # training X / y
-  X_te <- as.matrix(test_df[, feats]);  y_te <- test_df[[y_col]]           # held-out target X / y
-  m_lasso <- cv.glmnet(X_tr, y_tr, alpha = 1)                              # cross-validated LASSO
-  p_lasso <- as.numeric(predict(m_lasso, X_te, s = "lambda.min"))          # LASSO prediction
-  m_xgb <- xgboost(x = X_tr, y = y_tr, nrounds = 100, max_depth = 4,
-                   learning_rate = 0.1, verbosity = 0)                     # XGBoost fit (new xgboost API)
-  p_xgb <- as.numeric(predict(m_xgb, X_te))                                # XGBoost prediction
-  c(lasso = sqrt(mean((y_te - p_lasso)^2)),                                # LASSO RMSE
-    xgb   = sqrt(mean((y_te - p_xgb)^2)))                                  # XGBoost RMSE
+# ---- Process all crops ----
+results_by_crop <- lapply(crops, process_crop)
+names(results_by_crop) <- crops
+results_by_crop <- results_by_crop[!sapply(results_by_crop, is.null)]   # drop crops whose file was missing
+
+cat("\nCrops processed:", length(results_by_crop), "/", length(crops), "\n")
+
+# ---- Combine results across crops into two flat tables ----
+selection_all   <- bind_rows(lapply(results_by_crop, `[[`, "selection"))
+fingerprint_all <- bind_rows(lapply(results_by_crop, `[[`, "fingerprint"))
+
+# ---- Save everything as a single Excel workbook (no RDS) ----
+# Step 2 will re-read the raw panelv7_<crop>.xlsx files itself and just
+# use these tables to know which country plays which role, per crop.
+out_path <- file.path(proj_dir, "negstep1_output.xlsx")
+
+wb <- createWorkbook()
+addWorksheet(wb, "selection")     # crop, country, role (target/pool/candidate)
+addWorksheet(wb, "fingerprint")   # crop, country, climate/GDP fingerprint
+addWorksheet(wb, "crop_colors")   # crop -> hex color, for later plots
+
+writeData(wb, "selection", selection_all)
+writeData(wb, "fingerprint", fingerprint_all)
+writeData(wb, "crop_colors", crop_colors_df)
+
+saveWorkbook(wb, out_path, overwrite = TRUE)
+
+cat("\nStep 1 complete. Output saved to:\n", out_path, "\n")
+
+
+
+
+
+
+
+
+
+
+
+
+
+# =========================================================
+
+
+# =========================================================
+# negatifstep2.R
+# Negative Transfer pilot - Step 2: train models, compute
+# NT(s|S,t) for every (target, candidate) pair, and test
+# whether distance-based predictors track NT.
+# Runs for every crop found in negstep1_output.xlsx
+# =========================================================
+
+library(readxl)    # read xlsx input
+library(openxlsx)  # write xlsx output
+library(dplyr)      # data manipulation
+library(glmnet)     # LASSO
+library(xgboost)    # XGBoost
+
+set.seed(42)   # reproducibility
+
+# ---- 0. Folder paths (same convention as step 1) ----
+data_dir <- "C:/Users/Alper.Tosun/Desktop/cru130"
+proj_dir <- file.path(data_dir, "negatif_transfer")
+
+# ---- 1. Load step-1 output ----
+step1_path <- file.path(proj_dir, "negstep1_output.xlsx")
+selection   <- read_excel(step1_path, sheet = "selection")     # crop, country, role
+fingerprint <- read_excel(step1_path, sheet = "fingerprint")   # crop, country, climate/GDP fingerprint
+
+crops_available <- unique(selection$crop)   # crops that step 1 actually produced
+cat("Crops found in step-1 output:", paste(crops_available, collapse = ", "), "\n")
+
+# features used to predict yield
+# FINAL, SIMPLIFIED SPECIFICATION (after review):
+#  - CO2_ppm removed entirely: it is a purely global/time-level variable
+#    (identical across all countries within a given year), so it carries
+#    zero cross-country information and effectively behaves as a calendar-
+#    time proxy in a design meant to capture country-to-country transfer.
+#  - TMN_ann and DTR_ann removed: DTR = TMX - TMN by construction, so
+#    keeping TMX, TMN and DTR together creates an exact linear dependence.
+#  - PET_ann dropped to keep the design simple, per a deliberate decision
+#    to keep the feature set small.
+# Final set: two core climate variables (TMX, PRE) plus GDP per capita as
+# a robustness/control variable - three predictors total, consistent with
+# the fingerprint already used for country selection and distance (step 1).
+feature_cols <- c("TMX_ann", "PRE_ann", "GDP_per_Capita")
+
+# ---- Function: fit LASSO on train_df, return RMSE on test_df ----
+fit_lasso_rmse <- function(train_df, test_df) {
+  x_train <- as.matrix(train_df[, feature_cols])         # predictor matrix
+  y_train <- log(train_df$yield_hg_per_ha)                # log-yield as response (stabilizes variance)
+  x_test  <- as.matrix(test_df[, feature_cols])
+  y_test  <- log(test_df$yield_hg_per_ha)
+
+  cvfit <- cv.glmnet(x_train, y_train, alpha = 1, nfolds = 5)   # alpha=1 -> LASSO, pick lambda by 5-fold CV
+  pred  <- predict(cvfit, newx = x_test, s = "lambda.min")       # predict at the best lambda
+
+  sqrt(mean((exp(pred) - exp(y_test))^2))   # RMSE back on the original yield scale
 }
 
-load_model_libs <- function() {                                            # only needed by the heavy steps
-  suppressPackageStartupMessages({ library(glmnet); library(xgboost) })
+# ---- Function: fit XGBoost on train_df, return RMSE on test_df ----
+fit_xgb_rmse <- function(train_df, test_df) {
+  x_train <- as.matrix(train_df[, feature_cols])
+  y_train <- log(train_df$yield_hg_per_ha)
+  x_test  <- as.matrix(test_df[, feature_cols])
+  y_test  <- log(test_df$yield_hg_per_ha)
+
+  model <- xgboost(x = x_train, y = y_train, nrounds = 100, max_depth = 4,
+                   learning_rate = 0.1, objective = "reg:squarederror")   # xgboost R API (>=2.0): x/y instead of DMatrix
+  pred <- predict(model, x_test)
+
+  sqrt(mean((exp(pred) - exp(y_test))^2))
 }
 
-smoke_test_models <- function() {                                          # fail fast (seconds) instead of after hours
-  set.seed(1)
-  d <- data.frame(TMX_ann = rnorm(60), PRE_ann = rnorm(60), GDP_per_Capita = rnorm(60))
-  d[[y_col]] <- d$TMX_ann + rnorm(60)
-  r <- fit_and_rmse(d[1:40, ], d[41:60, ])
-  stopifnot(all(is.finite(r)))
-  cat("Model smoke test passed (LASSO RMSE", round(r["lasso"], 3), "| XGB RMSE", round(r["xgb"], 3), ")\n")
+# ---- Function: Mahalanobis distance between two countries' fingerprints ----
+mahalanobis_dist <- function(fp_mat, cov_inv, country_a, country_b) {
+  diff_vec <- fp_mat[country_a, ] - fp_mat[country_b, ]
+  sqrt(as.numeric(t(diff_vec) %*% cov_inv %*% diff_vec))
 }
 
-build_graph <- function(s1, crop_name, metric, max_repeat = Inf) {        # positive-NT undirected weighted graph
-  g_df <- s1 %>%
-    filter(crop == crop_name, repeat_id <= max_repeat) %>%                 # optionally use only the first repeats
-    group_by(target, candidate) %>%
-    summarise(w = mean(.data[[metric]]), .groups = "drop") %>%             # average NT across repeats
-    filter(w > 0)                                                          # keep only "helpful" pairs
-  edges <- g_df %>% transmute(from = candidate, to = target, weight = w)
-  gr <- graph_from_data_frame(edges, directed = FALSE)                     # candidate - target edges
-  simplify(gr, edge.attr.comb = list(weight = "sum"))                      # merge reciprocal edges by summing weight
+# ---- Process a single crop: compute NT for every (target, candidate) pair ----
+process_crop_step2 <- function(crop_name) {
+
+  cat("\n----", toupper(crop_name), "----\n")
+
+  file_path <- file.path(data_dir, paste0("panelv7_", crop_name, ".xlsx"))
+  df <- read_excel(file_path) %>%
+    filter(complete.cases(select(., all_of(c("yield_hg_per_ha", feature_cols)))))   # drop rows with missing features
+
+  sel_crop <- selection %>% filter(crop == crop_name)
+  target_countries    <- sel_crop$country[sel_crop$role == "target"]
+  pool_countries      <- sel_crop$country[sel_crop$role == "pool"]
+  candidate_countries <- sel_crop$country[sel_crop$role == "candidate"]
+
+  # fingerprint matrix for Mahalanobis distance (one row per country)
+  fp_crop <- fingerprint %>% filter(crop == crop_name)
+  fp_mat  <- as.matrix(fp_crop[, c("mean_TMX","sd_TMX","mean_PRE","sd_PRE","mean_GDP")])
+  rownames(fp_mat) <- fp_crop$Country_ISO
+  cov_inv <- solve(cov(fp_mat))   # inverse covariance, shared across all distance calculations for this crop
+
+  pool_data <- df %>% filter(Country_ISO %in% pool_countries)   # fixed pool S training data (reused for every target)
+
+  results <- list()   # collect one row per (target, candidate, model)
+
+  for (t in target_countries) {
+
+    test_data <- df %>% filter(Country_ISO == t)
+    if (nrow(test_data) < 5) next   # too few rows to evaluate reliably, skip this target
+    n_obs_target <- nrow(test_data)   # target's own observation count (for later sample-size robustness checks)
+
+    # ---- baseline: train on S only ----
+    rmse_base_lasso <- fit_lasso_rmse(pool_data, test_data)
+    rmse_base_xgb   <- fit_xgb_rmse(pool_data, test_data)
+
+    for (s in candidate_countries) {
+
+      cand_data <- df %>% filter(Country_ISO == s)
+      if (nrow(cand_data) < 5) next   # skip candidates with too little data
+      n_obs_candidate <- nrow(cand_data)   # candidate's observation count - how many rows it adds to the pool
+
+      train_plus_s <- bind_rows(pool_data, cand_data)   # S union {s}
+
+      rmse_add_lasso <- fit_lasso_rmse(train_plus_s, test_data)
+      rmse_add_xgb   <- fit_xgb_rmse(train_plus_s, test_data)
+
+      d_st <- mahalanobis_dist(fp_mat, cov_inv, s, t)   # simple pairwise distance predictor
+
+      results[[length(results) + 1]] <- data.frame(
+        crop      = crop_name,
+        target    = t,
+        candidate = s,
+        D_mahalanobis = d_st,
+        NT_lasso  = rmse_base_lasso - rmse_add_lasso,   # positive = candidate helped, negative = negative transfer
+        NT_xgb    = rmse_base_xgb   - rmse_add_xgb,
+        n_obs_candidate = n_obs_candidate,   # NEW: candidate's row count - lets us check whether NT is confounded with sample-size imbalance
+        n_obs_target    = n_obs_target       # NEW: target's own row count
+      )
+    }
+    cat("  target", t, "done (", length(candidate_countries), "candidates )\n")
+  }
+
+  bind_rows(results)
 }
 
-louvain <- function(gr, seed) {                                            # seeded Louvain (it has a random component)
+# ---- Run step 2 for every crop ----
+all_results <- bind_rows(lapply(crops_available, process_crop_step2))
+
+cat("\nTotal (target, candidate) pairs evaluated:", nrow(all_results), "\n")
+
+# ---- Summary: does distance predict NT? (Spearman correlation, per crop and model) ----
+summary_tbl <- all_results %>%
+  group_by(crop) %>%
+  summarise(
+    n_pairs                 = n(),
+    pct_negative_NT_lasso    = mean(NT_lasso < 0) * 100,          # share of pairs that are negative transfer (LASSO)
+    pct_negative_NT_xgb      = mean(NT_xgb   < 0) * 100,          # same, for XGBoost
+    spearman_D_vs_NT_lasso   = cor(D_mahalanobis, NT_lasso, method = "spearman"),
+    spearman_D_vs_NT_xgb     = cor(D_mahalanobis, NT_xgb,   method = "spearman"),
+    .groups = "drop"
+  )
+
+print(summary_tbl)
+
+# ---- Save everything as Excel (no RDS) ----
+out_path <- file.path(proj_dir, "negstep2_output.xlsx")
+
+wb <- createWorkbook()
+addWorksheet(wb, "pairwise_results")   # every (target, candidate) row with NT and distance
+addWorksheet(wb, "summary_by_crop")    # per-crop Spearman correlation + % negative transfer
+
+writeData(wb, "pairwise_results", all_results)
+writeData(wb, "summary_by_crop", summary_tbl)
+
+saveWorkbook(wb, out_path, overwrite = TRUE)
+
+cat("\nStep 2 complete. Output saved to:\n", out_path, "\n")
+
+
+# =========================================================
+# negatifstep3.R
+# Negative Transfer pilot - Step 3: compute the pool-aware
+# distance D_pool(s,S,t) and check whether it predicts NT
+# better than the plain pairwise distance D(s,t) from step 2.
+# =========================================================
+
+library(readxl)    # read xlsx input
+library(openxlsx)  # write xlsx output
+library(dplyr)      # data manipulation
+
+set.seed(42)
+
+# ---- 0. Folder paths (same convention as steps 1-2) ----
+data_dir <- "C:/Users/Alper.Tosun/Desktop/cru130"
+proj_dir <- file.path(data_dir, "negatif_transfer")
+
+# ---- 1. Load step-1 and step-2 output ----
+step1_path <- file.path(proj_dir, "negstep1_output.xlsx")
+step2_path <- file.path(proj_dir, "negstep2_output.xlsx")
+
+selection   <- read_excel(step1_path, sheet = "selection")           # crop, country, role
+fingerprint <- read_excel(step1_path, sheet = "fingerprint")         # crop, country, climate/GDP fingerprint
+pairwise    <- read_excel(step2_path, sheet = "pairwise_results")    # crop, target, candidate, D_mahalanobis, NT_lasso, NT_xgb
+
+crops_available <- unique(selection$crop)
+cat("Crops to process:", paste(crops_available, collapse = ", "), "\n")
+
+# ---- Function: Mahalanobis distance between two countries' fingerprints ----
+mahalanobis_dist <- function(fp_mat, cov_inv, country_a, country_b) {
+  diff_vec <- fp_mat[country_a, ] - fp_mat[country_b, ]
+  sqrt(as.numeric(t(diff_vec) %*% cov_inv %*% diff_vec))
+}
+
+# ---- Process one crop: compute D_pool for every (target, candidate) pair ----
+process_crop_step3 <- function(crop_name) {
+  
+  cat("\n----", toupper(crop_name), "----\n")
+  
+  sel_crop <- selection %>% filter(crop == crop_name)
+  target_countries <- sel_crop$country[sel_crop$role == "target"]
+  pool_countries   <- sel_crop$country[sel_crop$role == "pool"]
+  
+  fp_crop <- fingerprint %>% filter(crop == crop_name)
+  fp_mat  <- as.matrix(fp_crop[, c("mean_TMX","sd_TMX","mean_PRE","sd_PRE","mean_GDP")])
+  rownames(fp_mat) <- fp_crop$Country_ISO
+  cov_inv <- solve(cov(fp_mat))   # same inverse covariance used in step 2, for consistency
+  
+  pairwise_crop <- pairwise %>% filter(crop == crop_name)   # NT values already computed in step 2
+  
+  out <- list()
+  
+  for (t in target_countries) {
+    
+    # average distance from the fixed pool S to this target (does not depend on the candidate)
+    dist_S_to_t <- sapply(pool_countries, function(p) mahalanobis_dist(fp_mat, cov_inv, p, t))
+    avg_dist_S  <- mean(dist_S_to_t)
+    
+    rows_t <- pairwise_crop %>% filter(target == t)
+    
+    for (i in seq_len(nrow(rows_t))) {
+      s <- rows_t$candidate[i]
+      
+      # average distance from S union {s} to target = weighted average of the pool's distances and s's own distance
+      dist_s_to_t <- mahalanobis_dist(fp_mat, cov_inv, s, t)
+      avg_dist_Ss <- (sum(dist_S_to_t) + dist_s_to_t) / (length(pool_countries) + 1)
+      
+      D_pool <- avg_dist_Ss - avg_dist_S   # positive = adding s moves the pool further from target on average
+      
+      out[[length(out) + 1]] <- data.frame(
+        crop      = crop_name,
+        target    = t,
+        candidate = s,
+        D_pool    = D_pool
+      )
+    }
+  }
+  
+  bind_rows(out)
+}
+
+# ---- Run step 3 for every crop ----
+dpool_all <- bind_rows(lapply(crops_available, process_crop_step3))
+
+# ---- Join D_pool back onto the step-2 results (which already has D_mahalanobis, NT_lasso, NT_xgb) ----
+combined <- pairwise %>%
+  left_join(dpool_all, by = c("crop", "target", "candidate"))
+
+# ---- Compare pairwise D vs pool-aware D_pool as predictors of NT (Spearman correlation) ----
+comparison_tbl <- combined %>%
+  group_by(crop) %>%
+  summarise(
+    n_pairs                    = n(),
+    spearman_D_vs_NT_lasso      = cor(D_mahalanobis, NT_lasso, method = "spearman"),
+    spearman_Dpool_vs_NT_lasso  = cor(D_pool,         NT_lasso, method = "spearman"),
+    spearman_D_vs_NT_xgb        = cor(D_mahalanobis, NT_xgb,   method = "spearman"),
+    spearman_Dpool_vs_NT_xgb    = cor(D_pool,         NT_xgb,   method = "spearman"),
+    .groups = "drop"
+  )
+
+# overall row across all crops pooled together
+overall_row <- combined %>%
+  summarise(
+    crop = "ALL_CROPS_POOLED",
+    n_pairs = n(),
+    spearman_D_vs_NT_lasso     = cor(D_mahalanobis, NT_lasso, method = "spearman"),
+    spearman_Dpool_vs_NT_lasso = cor(D_pool,         NT_lasso, method = "spearman"),
+    spearman_D_vs_NT_xgb       = cor(D_mahalanobis, NT_xgb,   method = "spearman"),
+    spearman_Dpool_vs_NT_xgb   = cor(D_pool,         NT_xgb,   method = "spearman")
+  )
+
+comparison_tbl <- bind_rows(comparison_tbl, overall_row)
+
+print(comparison_tbl)
+
+# ---- Save everything as Excel (no RDS) ----
+out_path <- file.path(proj_dir, "negstep3_output.xlsx")
+
+wb <- createWorkbook()
+addWorksheet(wb, "pairwise_with_Dpool")   # every (target, candidate) row with both D and D_pool and NT
+addWorksheet(wb, "D_vs_Dpool_comparison") # per-crop + overall Spearman comparison
+
+writeData(wb, "pairwise_with_Dpool", combined)
+writeData(wb, "D_vs_Dpool_comparison", comparison_tbl)
+
+saveWorkbook(wb, out_path, overwrite = TRUE)
+
+cat("\nStep 3 complete. Output saved to:\n", out_path, "\n")
+
+
+
+
+
+
+
+
+
+
+
+
+# =========================================================
+
+
+# =========================================================
+# negatifstep4.R
+# Negative Transfer pilot - Step 4: can a NONLINEAR model,
+# using distance-based and fingerprint-difference features,
+# predict I(NT<0) better than the plain rank correlations
+# from steps 2-3?
+# Evaluated with 5-fold cross-validated AUROC and PR-AUC.
+# =========================================================
+
+library(readxl)    # read xlsx input
+library(openxlsx)  # write xlsx output
+library(dplyr)      # data manipulation
+library(xgboost)    # nonlinear classifier
+
+set.seed(42)
+
+# ---- 0. Folder paths (same convention as steps 1-3) ----
+data_dir <- "C:/Users/Alper.Tosun/Desktop/cru130"
+proj_dir <- file.path(data_dir, "negatif_transfer")
+
+# ---- 1. Load step-1 and step-3 output ----
+# step3's "pairwise_with_Dpool" sheet already has crop, target, candidate,
+# D_mahalanobis, D_pool, NT_lasso, NT_xgb - everything we need except the
+# raw fingerprint components, which we pull from step 1 to build extra features.
+step1_path <- file.path(proj_dir, "negstep1_output.xlsx")
+step3_path <- file.path(proj_dir, "negstep3_output.xlsx")
+
+fingerprint <- read_excel(step1_path, sheet = "fingerprint")             # crop, country, climate/GDP fingerprint
+combined    <- read_excel(step3_path, sheet = "pairwise_with_Dpool")     # crop, target, candidate, D, D_pool, NT_lasso, NT_xgb
+
+cat("Total pairs loaded:", nrow(combined), "\n")
+
+# ---- 2. Build extra features: raw fingerprint differences (candidate - target) ----
+fp_target <- fingerprint %>%
+  rename_with(~ paste0("t_", .), c(mean_TMX, sd_TMX, mean_PRE, sd_PRE, mean_GDP)) %>%
+  rename(target = Country_ISO)
+
+fp_candidate <- fingerprint %>%
+  rename_with(~ paste0("s_", .), c(mean_TMX, sd_TMX, mean_PRE, sd_PRE, mean_GDP)) %>%
+  rename(candidate = Country_ISO)
+
+feat <- combined %>%
+  left_join(fp_target,    by = c("crop", "target")) %>%
+  left_join(fp_candidate, by = c("crop", "candidate")) %>%
+  mutate(
+    diff_TMX = s_mean_TMX - t_mean_TMX,   # raw temperature gap (not just its magnitude, like D does)
+    diff_PRE = s_mean_PRE - t_mean_PRE,   # raw precipitation gap
+    diff_GDP = s_mean_GDP - t_mean_GDP    # raw GDP gap
+  )
+
+feature_cols <- c("D_mahalanobis", "D_pool", "diff_TMX", "diff_PRE", "diff_GDP")
+
+# one-hot encode crop so the pooled model can learn crop-specific baselines
+crop_dummies <- model.matrix(~ crop - 1, data = feat)
+
+# ---- Function: 5-fold CV AUROC (rank-based, no extra package needed) ----
+auroc <- function(scores, labels) {
+  n1 <- sum(labels == 1); n0 <- sum(labels == 0)
+  if (n1 == 0 || n0 == 0) return(NA)
+  r <- rank(scores)
+  (sum(r[labels == 1]) - n1 * (n1 + 1) / 2) / (n1 * n0)
+}
+
+# ---- Function: 5-fold CV PR-AUC (trapezoidal integration over precision-recall points) ----
+pr_auc <- function(scores, labels) {
+  ord <- order(-scores)
+  lab <- labels[ord]
+  tp <- cumsum(lab)
+  fp <- cumsum(1 - lab)
+  precision <- tp / (tp + fp)
+  recall    <- tp / sum(lab)
+  auc <- 0; prev_r <- 0; prev_p <- 1
+  for (i in seq_along(recall)) {
+    auc <- auc + (recall[i] - prev_r) * (precision[i] + prev_p) / 2   # trapezoid area under this segment
+    prev_r <- recall[i]; prev_p <- precision[i]
+  }
+  auc
+}
+
+# ---- Function: 5-fold CV for one NT column, return out-of-fold AUROC and PR-AUC ----
+# for both the nonlinear (XGBoost) model and a simple linear (logistic) baseline.
+#
+# CORRECTED AFTER REVIEW (round 1): the original version used a RANDOM
+# row-level fold split. Because many rows share the same target country
+# (every candidate paired with that target) or the same candidate country
+# (paired with many targets), random splitting can put highly similar rows
+# into both the training and test fold, inflating apparent AUROC.
+#
+# CORRECTED AGAIN AFTER REVIEW (round 2): the first correction grouped folds
+# by (crop, target) - e.g., "wheat_TUR" and "maize_TUR" were treated as two
+# DIFFERENT groups. But the same country is sometimes selected as a target
+# in more than one crop (empirically: 8 of 40 target slots, 11 slots overall,
+# representing repeats among only 29 distinct countries out of 40 slots).
+# Under (crop, target) grouping, a country like Turkey could appear as a
+# target in the training fold via one crop (e.g., maize) while also
+# appearing as a target in the test fold via a different crop (e.g., wheat).
+# Since crop identity is itself a model feature, this is a real, if
+# narrower, country-level leakage channel that (crop, target) grouping does
+# NOT close. We now additionally support COUNTRY-level grouping - every row
+# for a given target country, across ALL crops in which it is ever a
+# target, is assigned to the same fold - which fully closes this channel.
+# All three grouping schemes are computed and reported side by side so the
+# effect of each correction can be seen directly.
+#
+# grouping = "random" (original, row-level) | "crop_target" (round-1 fix,
+# grouped by (crop, target) pair) | "country" (round-2 fix, grouped by
+# target country alone, closing the cross-crop repeat-target channel)
+run_cv <- function(nt_col, x_all, grouping = c("country", "crop_target", "random"), include_nobs = FALSE) {
+  grouping <- match.arg(grouping)
+
+  y <- as.integer(feat[[nt_col]] < 0)     # 1 = negative transfer, 0 = not
+  n <- nrow(feat)
+
+  if (grouping == "country") {
+    group_id <- feat$target                                           # group by country alone, ignoring which crop
+    unique_groups <- unique(group_id)
+    group_fold <- setNames(sample(rep(1:5, length.out = length(unique_groups))), unique_groups)
+    folds <- group_fold[group_id]
+  } else if (grouping == "crop_target") {
+    group_id <- paste(feat$crop, feat$target, sep = "_")              # unique (crop, target) group id
+    unique_groups <- unique(group_id)
+    group_fold <- setNames(sample(rep(1:5, length.out = length(unique_groups))), unique_groups)
+    folds <- group_fold[group_id]                                     # every row inherits its (crop,target) group's fold
+  } else {
+    folds <- sample(rep(1:5, length.out = n))                         # original behavior: random row-level split
+  }
+
+  oof_xgb    <- numeric(n)   # out-of-fold predicted probability, XGBoost
+  oof_linear <- numeric(n)   # out-of-fold predicted probability, logistic regression baseline
+
+  for (k in 1:5) {
+    train_idx <- which(folds != k)
+    test_idx  <- which(folds == k)
+
+    # nonlinear model
+    model_xgb <- xgboost(x = x_all[train_idx, ], y = factor(y[train_idx]),
+                         nrounds = 100, max_depth = 3, learning_rate = 0.1,
+                         objective = "binary:logistic")
+    oof_xgb[test_idx] <- predict(model_xgb, x_all[test_idx, ])
+
+    # simple linear baseline for comparison (does nonlinearity actually help?)
+    x_dist_only <- x_all[, !(colnames(x_all) %in% colnames(crop_dummies)), drop = FALSE]
+    train_df <- data.frame(y = y[train_idx], x_dist_only[train_idx, , drop = FALSE])
+    test_df  <- data.frame(x_dist_only[test_idx, , drop = FALSE])
+    model_lin <- glm(y ~ ., data = train_df, family = binomial())
+    oof_linear[test_idx] <- predict(model_lin, newdata = test_df, type = "response")
+  }
+
+  data.frame(
+    nt_column        = nt_col,
+    cv_grouping       = grouping,
+    includes_nobs     = include_nobs,
+    auroc_xgb        = auroc(oof_xgb, y),
+    pr_auc_xgb       = pr_auc(oof_xgb, y),
+    auroc_linear     = auroc(oof_linear, y),
+    pr_auc_linear    = pr_auc(oof_linear, y),
+    pct_negative     = mean(y) * 100
+  )
+}
+
+# ---- Feature matrices: base (distance + crop dummies) and base + n_obs controls ----
+x_dist <- as.matrix(feat[, feature_cols])
+x_base <- cbind(x_dist, crop_dummies)   # distance features + crop dummies (original feature set)
+
+# NEW: n_obs-augmented feature matrix - adds candidate's and target's observation
+# counts as explicit controls, to check whether NT is partly explained by pure
+# sample-size imbalance (a large candidate contributing many more training rows
+# than a small one) rather than genuine climatic/economic incompatibility.
+x_nobs <- cbind(x_base, n_obs_candidate = feat$n_obs_candidate, n_obs_target = feat$n_obs_target)
+
+# ---- Run all combinations: {country, crop_target, random} x {base, +nobs} ----
+# Country-level grouping is now the corrected, primary result. crop_target
+# (round-1 fix) and random (original) are kept for direct, three-way
+# before/after comparison with the original (uncorrected) design.
+results_all <- bind_rows(
+  run_cv("NT_lasso", x_base, grouping = "country",     include_nobs = FALSE),
+  run_cv("NT_xgb",   x_base, grouping = "country",     include_nobs = FALSE),
+  run_cv("NT_lasso", x_base, grouping = "crop_target", include_nobs = FALSE),
+  run_cv("NT_xgb",   x_base, grouping = "crop_target", include_nobs = FALSE),
+  run_cv("NT_lasso", x_base, grouping = "random",      include_nobs = FALSE),
+  run_cv("NT_xgb",   x_base, grouping = "random",      include_nobs = FALSE),
+  run_cv("NT_lasso", x_nobs, grouping = "country",     include_nobs = TRUE),
+  run_cv("NT_xgb",   x_nobs, grouping = "country",     include_nobs = TRUE)
+)
+print(results_all)
+
+# DIAGNOSTIC ADDITION: report how many target slots / distinct countries are
+# involved in the cross-crop repeat-target issue that motivated the country-
+# level grouping fix, so this is documented alongside the corrected results.
+target_slots <- feat %>% distinct(crop, target)
+repeat_summary <- target_slots %>%
+  count(target, name = "n_crops_as_target") %>%
+  filter(n_crops_as_target > 1)
+cat("\n--- DIAGNOSTIC: countries selected as target in more than one crop ---\n")
+cat("Total target slots (crop, target):", nrow(target_slots), "\n")
+cat("Distinct countries among those slots:", n_distinct(target_slots$target), "\n")
+cat("Countries repeating as target across crops:", nrow(repeat_summary), "\n")
+print(repeat_summary)
+
+# ---- Save everything as Excel (no RDS) ----
+out_path <- file.path(proj_dir, "negstep4_output.xlsx")
+
+wb <- createWorkbook()
+addWorksheet(wb, "cv_results")           # AUROC / PR-AUC for every {grouping x nobs} combination, for each NT definition
+addWorksheet(wb, "feature_table")        # the feature matrix used (for inspection / reuse)
+addWorksheet(wb, "repeat_target_countries")  # DIAGNOSTIC: countries selected as target in >1 crop
+
+writeData(wb, "cv_results", results_all)
+writeData(wb, "feature_table", feat)
+writeData(wb, "repeat_target_countries", repeat_summary)
+
+saveWorkbook(wb, out_path, overwrite = TRUE)
+
+cat("\nStep 4 complete. Output saved to:\n", out_path, "\n")
+cat("Compare cv_grouping == \"country\" (fully corrected) vs \"crop_target\" (round-1 fix, still has cross-crop leakage) vs \"random\" (original) rows to see the effect of each correction.\n")
+
+
+
+
+
+
+
+
+
+
+# =========================================================
+
+
+# =========================================================
+# negatifstep5.R
+# Negative Transfer pilot - Step 5: leave-one-crop-out (LOCO)
+# validation. Train the NT<0 classifier on 7 crops, test on
+# the held-out crop (repeated for each crop), to check whether
+# the distance-based signal from step 4 actually generalizes
+# across crops rather than being crop-specific.
+# =========================================================
+
+library(readxl)    # read xlsx input
+library(openxlsx)  # write xlsx output
+library(dplyr)      # data manipulation
+library(xgboost)    # nonlinear classifier
+
+set.seed(42)
+
+# ---- 0. Folder paths (same convention as steps 1-4) ----
+data_dir <- "C:/Users/Alper.Tosun/Desktop/cru130"
+proj_dir <- file.path(data_dir, "negatif_transfer")
+
+# ---- 1. Load step-4 feature table (already has D, D_pool, and the raw diffs) ----
+step4_path <- file.path(proj_dir, "negstep4_output.xlsx")
+feat <- read_excel(step4_path, sheet = "feature_table")
+
+feature_cols <- c("D_mahalanobis", "D_pool", "diff_TMX", "diff_PRE", "diff_GDP")
+crops_available <- unique(feat$crop)
+cat("Crops:", paste(crops_available, collapse = ", "), "\n")
+
+# NOTE: no crop dummy variables here on purpose - the whole point of this
+# step is to test whether the model generalizes to a crop it has never
+# seen, so crop identity cannot be a usable feature.
+
+# ---- Function: AUROC (rank-based) ----
+auroc <- function(scores, labels) {
+  n1 <- sum(labels == 1); n0 <- sum(labels == 0)
+  if (n1 == 0 || n0 == 0) return(NA)
+  r <- rank(scores)
+  (sum(r[labels == 1]) - n1 * (n1 + 1) / 2) / (n1 * n0)
+}
+
+# ---- Function: PR-AUC (trapezoidal integration) ----
+pr_auc <- function(scores, labels) {
+  ord <- order(-scores)
+  lab <- labels[ord]
+  tp <- cumsum(lab)
+  fp <- cumsum(1 - lab)
+  precision <- tp / (tp + fp)
+  recall    <- tp / sum(lab)
+  auc <- 0; prev_r <- 0; prev_p <- 1
+  for (i in seq_along(recall)) {
+    auc <- auc + (recall[i] - prev_r) * (precision[i] + prev_p) / 2
+    prev_r <- recall[i]; prev_p <- precision[i]
+  }
+  auc
+}
+
+# ---- Function: run leave-one-crop-out for one NT definition ----
+run_loco <- function(nt_col) {
+  
+  y_all <- as.integer(feat[[nt_col]] < 0)
+  x_all <- as.matrix(feat[, feature_cols])
+  
+  oof_pred <- numeric(nrow(feat))   # holds each row's prediction from when ITS crop was held out
+  per_crop <- list()
+  
+  for (held_out in crops_available) {
+    
+    train_idx <- which(feat$crop != held_out)
+    test_idx  <- which(feat$crop == held_out)
+    
+    model <- xgboost(x = x_all[train_idx, ], y = factor(y_all[train_idx]),
+                     nrounds = 100, max_depth = 3, learning_rate = 0.1,
+                     objective = "binary:logistic")
+    
+    pred <- predict(model, x_all[test_idx, ])
+    oof_pred[test_idx] <- pred
+    
+    per_crop[[held_out]] <- data.frame(
+      nt_column     = nt_col,
+      held_out_crop = held_out,
+      n_test        = length(test_idx),
+      pct_negative  = mean(y_all[test_idx]) * 100,
+      auroc         = auroc(pred, y_all[test_idx]),
+      pr_auc        = pr_auc(pred, y_all[test_idx])
+    )
+  }
+  
+  per_crop_tbl <- bind_rows(per_crop)
+  
+  overall_row <- data.frame(
+    nt_column     = nt_col,
+    held_out_crop = "ALL_CROPS_POOLED",
+    n_test        = length(oof_pred),
+    pct_negative  = mean(y_all) * 100,
+    auroc         = auroc(oof_pred, y_all),
+    pr_auc        = pr_auc(oof_pred, y_all)
+  )
+  
+  bind_rows(per_crop_tbl, overall_row)
+}
+
+# ---- Run LOCO for both NT definitions ----
+results_lasso <- run_loco("NT_lasso")
+results_xgbnt <- run_loco("NT_xgb")
+
+results_all <- bind_rows(results_lasso, results_xgbnt)
+print(results_all)
+
+# ---- Save everything as Excel (no RDS) ----
+out_path <- file.path(proj_dir, "negstep5_output.xlsx")
+
+wb <- createWorkbook()
+addWorksheet(wb, "loco_results")   # per-crop and pooled AUROC / PR-AUC when that crop is held out
+
+writeData(wb, "loco_results", results_all)
+
+saveWorkbook(wb, out_path, overwrite = TRUE)
+
+cat("\nStep 5 complete. Output saved to:\n", out_path, "\n")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# =========================================================
+
+
+# =========================================================
+# NOTE: Step 6 (the 12-variable "rich" fingerprint) is retired.
+# After simplifying the model feature set to TMX + PRE + GDP
+# (see Step 2 above), a separately-built "rich" fingerprint
+# would be identical to Step 1's original fingerprint, so it
+# added nothing and has been removed from the pipeline.
+# =========================================================
+
+# =========================================================
+# negatifstep7.R
+# Negative Transfer pilot - Step 7 (SIMPLIFIED, after review):
+#  (A) oracle feature set - add pool-composition features (not
+#      just source-target distance) on top of step 4's D_mahalanobis/
+#      D_pool/diffs, and re-run leave-one-crop-out (LOCO) validation.
+#  (B) crop-stratified permutation test - is the LOCO AUROC really
+#      distinguishable from chance, given only 8 crops?
+#
+# NOTE: this step no longer depends on step 6. The old "rich"
+# 12-variable fingerprint used in step 6 is retired: after settling
+# on a simplified, 3-variable feature specification (TMX, PRE, GDP -
+# see step 2), the "rich" fingerprint would have been identical to
+# step 1's original fingerprint, so step 6 added nothing and has been
+# removed from the pipeline. This step now builds its oracle features
+# directly from step 1's fingerprint and step 4's feature table,
+# without re-reading the raw panelv7_<crop>.xlsx files at all.
+# =========================================================
+
+library(readxl)    # read xlsx input
+library(openxlsx)  # write xlsx output
+library(dplyr)      # data manipulation
+library(xgboost)    # nonlinear classifier
+
+set.seed(42)
+
+# ---- 0. Folder paths (same convention as steps 1-5) ----
+data_dir <- "C:/Users/Alper.Tosun/Desktop/cru130"
+proj_dir <- file.path(data_dir, "negatif_transfer")
+
+# ---- 1. Load step-1 (selection + fingerprint) and step-4 (NT + distance features) ----
+step1_path <- file.path(proj_dir, "negstep1_output.xlsx")
+step4_path <- file.path(proj_dir, "negstep4_output.xlsx")
+
+selection   <- read_excel(step1_path, sheet = "selection")               # crop, country, role
+fingerprint <- read_excel(step1_path, sheet = "fingerprint")             # crop, country, mean/sd TMX, mean/sd PRE, mean GDP
+feat        <- read_excel(step4_path, sheet = "feature_table") %>%       # crop, target, candidate, D_mahalanobis, D_pool, diffs, NT_lasso, NT_xgb
+  select(crop, target, candidate, D_mahalanobis, D_pool, diff_TMX, diff_PRE, diff_GDP, NT_lasso, NT_xgb)
+
+crops_in_feat <- unique(feat$crop)
+cat("Crops:", paste(crops_in_feat, collapse = ", "), "\n")
+
+# ---- 2. Build ORACLE features: pool composition, not just source-target distance ----
+# For each crop we use its step-1 fingerprint (mean_TMX, sd_TMX, mean_PRE, sd_PRE,
+# mean_GDP - the same fingerprint used throughout the pipeline) to compute:
+#  - pool_heterogeneity:   average pairwise distance WITHIN the pool (is S diverse or redundant?)
+#  - cand_to_poolcentroid: distance from the candidate to the pool's centroid (is it a pool outlier?)
+#  - cand_redundancy:      candidate's minimum distance to any single pool member (redundancy proxy)
+#  - extrapolation_flag:   1 if the candidate is more extreme than the whole pool on any
+#                          fingerprint dimension (rough proxy for "outside the pool's support")
+
+build_oracle_features <- function(crop_name) {
+
+  cat("\n----", toupper(crop_name), "----\n")
+
+  sel_crop <- selection %>% filter(crop == crop_name)
+  pool_countries <- sel_crop$country[sel_crop$role == "pool"]
+
+  fp_crop <- fingerprint %>% filter(crop == crop_name)
+  fp_mat  <- as.matrix(fp_crop[, c("mean_TMX","sd_TMX","mean_PRE","sd_PRE","mean_GDP")])
+  rownames(fp_mat) <- fp_crop$Country_ISO
+  fp_scaled <- scale(fp_mat)                     # standardize before computing distances (units differ)
+  rownames(fp_scaled) <- fp_crop$Country_ISO
+
+  euc <- function(a, b) sqrt(sum((fp_scaled[a, ] - fp_scaled[b, ])^2))   # plain Euclidean, used for pool diversity
+
+  pool_ok <- intersect(pool_countries, rownames(fp_scaled))
+
+  # pool heterogeneity: mean pairwise Euclidean distance among pool members (one number per crop)
+  pool_pairs <- combn(pool_ok, 2, simplify = FALSE)
+  pool_heterogeneity <- mean(sapply(pool_pairs, function(p) euc(p[1], p[2])))
+
+  pool_centroid <- colMeans(fp_scaled[pool_ok, , drop = FALSE])   # average fingerprint of the pool
+
+  rows_crop <- feat %>% filter(crop == crop_name)
+
+  out <- list()
+  for (i in seq_len(nrow(rows_crop))) {
+    s <- rows_crop$candidate[i]
+    if (!(s %in% rownames(fp_scaled))) next
+
+    dist_to_centroid <- sqrt(sum((fp_scaled[s, ] - pool_centroid)^2))       # candidate's distance to the pool's "center"
+    min_dist_to_pool  <- min(sapply(pool_ok, function(p) euc(s, p)))         # candidate's distance to its nearest pool member
+
+    # extrapolation flag: is the candidate more extreme than every pool member on at least one dimension?
+    cand_vec   <- fp_scaled[s, ]
+    pool_range <- apply(fp_scaled[pool_ok, , drop = FALSE], 2, range)
+    outside <- any(cand_vec < pool_range[1, ] | cand_vec > pool_range[2, ])
+
+    out[[length(out) + 1]] <- data.frame(
+      crop = crop_name, target = rows_crop$target[i], candidate = s,
+      pool_heterogeneity = pool_heterogeneity,
+      cand_to_poolcentroid = dist_to_centroid,
+      cand_redundancy = min_dist_to_pool,
+      extrapolation_flag = as.integer(outside)
+    )
+  }
+
+  bind_rows(out)
+}
+
+oracle_feats <- bind_rows(lapply(crops_in_feat, build_oracle_features))
+
+feat_full <- feat %>% inner_join(oracle_feats, by = c("crop", "target", "candidate"))
+cat("\nPairs with oracle features attached:", nrow(feat_full), "\n")
+
+feature_cols <- c("D_mahalanobis", "D_pool", "diff_TMX", "diff_PRE", "diff_GDP",
+                   "pool_heterogeneity", "cand_to_poolcentroid", "cand_redundancy", "extrapolation_flag")
+
+# ---- AUROC / PR-AUC helpers (same as previous steps) ----
+auroc <- function(scores, labels) {
+  n1 <- sum(labels == 1); n0 <- sum(labels == 0)
+  if (n1 == 0 || n0 == 0) return(NA)
+  r <- rank(scores)
+  (sum(r[labels == 1]) - n1 * (n1 + 1) / 2) / (n1 * n0)
+}
+pr_auc <- function(scores, labels) {
+  ord <- order(-scores)
+  lab <- labels[ord]
+  tp <- cumsum(lab); fp <- cumsum(1 - lab)
+  precision <- tp / (tp + fp); recall <- tp / sum(lab)
+  auc <- 0; prev_r <- 0; prev_p <- 1
+  for (i in seq_along(recall)) {
+    auc <- auc + (recall[i] - prev_r) * (precision[i] + prev_p) / 2
+    prev_r <- recall[i]; prev_p <- precision[i]
+  }
+  auc
+}
+
+# ---- LOCO with the oracle feature set ----
+run_loco <- function(nt_col) {
+  y_all <- as.integer(feat_full[[nt_col]] < 0)
+  x_all <- as.matrix(feat_full[, feature_cols])
+  crops_here <- unique(feat_full$crop)
+
+  oof_pred <- numeric(nrow(feat_full))
+  per_crop <- list()
+
+  for (held_out in crops_here) {
+    train_idx <- which(feat_full$crop != held_out)
+    test_idx  <- which(feat_full$crop == held_out)
+    if (length(test_idx) == 0) next
+
+    model <- xgboost(x = x_all[train_idx, ], y = factor(y_all[train_idx]),
+                      nrounds = 100, max_depth = 3, learning_rate = 0.1,
+                      objective = "binary:logistic")
+    pred <- predict(model, x_all[test_idx, ])
+    oof_pred[test_idx] <- pred
+
+    # DIAGNOSTIC ADDITION (per external review): record each held-out crop's
+    # label prevalence and out-of-fold score distribution. Under crop-
+    # stratified permutation, the null distribution of the POOLED AUROC is
+    # only guaranteed to center on 0.5 if crops are exchangeable in both (a)
+    # NT<0 prevalence and (b) the distribution of oof_pred scores. If crops
+    # differ materially on either, pooling ranks across crops can shift the
+    # null mean away from 0.5 - a known property of pooled/marginal AUROC
+    # under within-stratum permutation (related to Simpson's-paradox-type
+    # aggregation bias), not necessarily a computation error. This table lets
+    # us check whether that is what is happening here, without changing the
+    # permutation procedure itself.
+    per_crop[[held_out]] <- data.frame(
+      nt_column = nt_col, held_out_crop = held_out, n_test = length(test_idx),
+      prevalence = mean(y_all[test_idx]),
+      pred_mean = mean(pred), pred_sd = sd(pred),
+      auroc = auroc(pred, y_all[test_idx]), pr_auc = pr_auc(pred, y_all[test_idx])
+    )
+  }
+
+  list(
+    per_crop = bind_rows(per_crop),
+    oof_pred = oof_pred,
+    y_all    = y_all,
+    overall_auroc = auroc(oof_pred, y_all)
+  )
+}
+
+# ---- Permutation test (stratified by crop) ----
+# Shuffles labels ONLY within each crop's own test block, preserving each
+# crop's true negative-transfer rate and the crop grouping structure, so
+# that only 8 crops (rather than thousands of non-independent pairs) are
+# implicitly treated as the independent unit.
+# CORRECTED AFTER REVIEW: the original two-sided p-value compared each
+# quantity's distance from the FIXED point 0.5 - i.e., it tested "how far
+# from 0.5 is the observed AUROC, compared to how far from 0.5 permuted
+# AUROCs get" - rather than the standard permutation-test question, "how
+# extreme is the observed statistic relative to the null distribution's OWN
+# realized values." These coincide only when the null distribution happens
+# to be centered at 0.5. When it is not (Section 3.5 documents exactly this,
+# with an NT_xgb null mean of 0.471 rather than 0.5), the old formula can
+# give a badly misleading p-value - in our case, changing "not distinguishable
+# from chance" into "distinguishable from chance" once corrected. We now
+# compute the p-value from each permuted statistic's distance from the
+# null distribution's own mean, with the standard +1/+1 continuity
+# correction (Davison & Hinkley, 1997) so that a zero-exceedance result is
+# reported as "< 1/(n_perm+1)" rather than an unjustified p = 0. We keep the
+# old, uncorrected p-value alongside the new one for direct comparison.
+permutation_test <- function(oof_pred, y_all, crop_vec, n_perm = 500) {
+  observed <- auroc(oof_pred, y_all)
+  perm_stats <- numeric(n_perm)
+  for (p in 1:n_perm) {
+    y_perm <- y_all
+    for (c in unique(crop_vec)) {
+      idx <- which(crop_vec == c)
+      y_perm[idx] <- sample(y_all[idx])   # shuffle labels ONLY inside this crop's block
+    }
+    perm_stats[p] <- auroc(oof_pred, y_perm)
+  }
+  null_mean <- mean(perm_stats)
+  p_value_old_uncorrected <- mean(abs(perm_stats - 0.5) >= abs(observed - 0.5))            # ORIGINAL (flawed) formula, kept for comparison only
+  exceed <- sum(abs(perm_stats - null_mean) >= abs(observed - null_mean))
+  p_value <- (exceed + 1) / (n_perm + 1)                                                    # CORRECTED formula: distance from the null's own mean, continuity-corrected
+  list(observed = observed, p_value = p_value, p_value_old_uncorrected = p_value_old_uncorrected,
+       perm_mean = null_mean, perm_sd = sd(perm_stats),
+       perm_stats = perm_stats)   # keep the full null distribution, not just its mean/sd
+}
+
+# ---- Run everything ----
+res_lasso <- run_loco("NT_lasso")
+res_xgb   <- run_loco("NT_xgb")
+
+perm_lasso <- permutation_test(res_lasso$oof_pred, res_lasso$y_all, feat_full$crop)
+perm_xgb   <- permutation_test(res_xgb$oof_pred,   res_xgb$y_all,   feat_full$crop)
+
+summary_tbl <- bind_rows(
+  data.frame(nt_column = "NT_lasso", observed_auroc = perm_lasso$observed,
+             permutation_p_value = perm_lasso$p_value,
+             permutation_p_value_OLD_uncorrected = perm_lasso$p_value_old_uncorrected,
+             null_mean = perm_lasso$perm_mean, null_sd = perm_lasso$perm_sd),
+  data.frame(nt_column = "NT_xgb", observed_auroc = perm_xgb$observed,
+             permutation_p_value = perm_xgb$p_value,
+             permutation_p_value_OLD_uncorrected = perm_xgb$p_value_old_uncorrected,
+             null_mean = perm_xgb$perm_mean, null_sd = perm_xgb$perm_sd)
+)
+
+cat("\n--- Permutation test summary (permutation_p_value is the CORRECTED formula; permutation_p_value_OLD_uncorrected is the original, flawed formula, kept only for comparison) ---\n")
+print(summary_tbl)
+
+per_crop_all <- bind_rows(res_lasso$per_crop, res_xgb$per_crop)
+cat("\n--- DIAGNOSTIC: per-crop prevalence and score distribution ---\n")
+print(per_crop_all)
+
+# DIAGNOSTIC ADDITION: overall (pooled, unconditional) label prevalence and
+# score summary, for comparison against the per-crop table above - if the
+# per-crop rows vary a lot around these pooled numbers, that heterogeneity
+# is the likely explanation for an off-center permutation null.
+diagnostic_overall <- bind_rows(
+  data.frame(nt_column = "NT_lasso", pooled_prevalence = mean(res_lasso$y_all),
+             pooled_pred_mean = mean(res_lasso$oof_pred), pooled_pred_sd = sd(res_lasso$oof_pred)),
+  data.frame(nt_column = "NT_xgb", pooled_prevalence = mean(res_xgb$y_all),
+             pooled_pred_mean = mean(res_xgb$oof_pred), pooled_pred_sd = sd(res_xgb$oof_pred))
+)
+
+# DIAGNOSTIC ADDITION: save the full null distribution (500 permuted AUROC
+# values) for each NT definition, so its shape (not just mean/sd) can be
+# inspected - e.g., plotted as a histogram - to check for anything unusual
+# beyond simple off-centering (skew, multimodality, etc.).
+null_distributions <- data.frame(
+  permutation_index = 1:500,
+  NT_lasso_null_auroc = perm_lasso$perm_stats,
+  NT_xgb_null_auroc   = perm_xgb$perm_stats
+)
+
+# ---- Save everything as Excel (no RDS) ----
+out_path <- file.path(proj_dir, "negstep7_output.xlsx")
+
+wb <- createWorkbook()
+addWorksheet(wb, "permutation_summary")   # observed AUROC vs. null distribution, p-value
+addWorksheet(wb, "loco_per_crop_oracle")  # per-crop LOCO AUROC/PR-AUC with the oracle feature set, now with prevalence + score distribution
+addWorksheet(wb, "oracle_feature_table")  # the oracle feature matrix used
+addWorksheet(wb, "diagnostic_overall")    # DIAGNOSTIC ADDITION: pooled prevalence/score summary for comparison
+addWorksheet(wb, "null_distributions")    # DIAGNOSTIC ADDITION: all 500 permuted AUROC values per NT definition
+
+writeData(wb, "permutation_summary", summary_tbl)
+writeData(wb, "loco_per_crop_oracle", per_crop_all)
+writeData(wb, "oracle_feature_table", feat_full)
+writeData(wb, "diagnostic_overall", diagnostic_overall)
+writeData(wb, "null_distributions", null_distributions)
+
+saveWorkbook(wb, out_path, overwrite = TRUE)
+
+cat("\nStep 7 complete. Output saved to:\n", out_path, "\n")
+cat("New diagnostic sheets: loco_per_crop_oracle (now includes prevalence/pred_mean/pred_sd), diagnostic_overall, null_distributions.\n")
+
+
+# =========================================================
+# negatifstep8.R
+# Negative Transfer pilot - Step 8: generate the two summary
+# figures used in the manuscript, using each crop's own color
+# (from crop_colors.rds / negstep1_output.xlsx) instead of a
+# generic two-color scheme. Within each crop: a SOLID (filled)
+# bar = LASSO-based NT, a HOLLOW (outline-only) bar = XGBoost-
+# based NT, both drawn in that crop's color.
+# No titles/captions are drawn inside the plots - captions go
+# in the manuscript text, not the image. Saved as both PDF and
+# PNG (1600 dpi) for every figure.
+# =========================================================
+
+library(readxl)   # read xlsx input
+library(dplyr)     # data manipulation
+library(ggplot2)   # plotting
+library(tidyr)      # pivot_longer
+
+# ---- 0. Folder paths (same convention as steps 1-7) ----
+data_dir <- "C:/Users/Alper.Tosun/Desktop/cru130"
+proj_dir <- file.path(data_dir, "negatif_transfer")
+fig_dir  <- file.path(proj_dir, "figures")
+if (!dir.exists(fig_dir)) dir.create(fig_dir, recursive = TRUE)
+
+# ---- 1. Load crop colors (fixed in step 1) and the crop order they were defined in ----
+crop_colors_df <- read_excel(file.path(proj_dir, "negstep1_output.xlsx"), sheet = "crop_colors")
+crop_order  <- crop_colors_df$crop                              # wheat, barley, oats, rye, rice, maize, soybean, sorghum
+crop_pal    <- setNames(crop_colors_df$color, crop_colors_df$crop)   # named vector: crop -> hex color
+
+# ---- Helper: save a ggplot as both PDF and 1600 dpi PNG, no title/caption baked in ----
+save_figure <- function(gg, filename_stem, width_in = 7.5, height_in = 4.2) {
+  ggsave(file.path(fig_dir, paste0(filename_stem, ".pdf")), gg, width = width_in, height = height_in, device = "pdf")
+  ggsave(file.path(fig_dir, paste0(filename_stem, ".png")), gg, width = width_in, height = height_in, dpi = 1600)
+}
+
+# ---- Shared theme: clean, no plot title/caption/subtitle elements used anywhere ----
+base_theme <- theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.minor = element_blank(),
+    axis.title.x = element_blank(),
+    legend.title = element_blank(),
+    legend.position = "top"
+  )
+
+# =========================================================
+# Figure 1: share of negative-transfer pairs, by crop
+# (data source: negstep2_output.xlsx, sheet "summary_by_crop")
+# =========================================================
+
+step2 <- read_excel(file.path(proj_dir, "negstep2_output.xlsx"), sheet = "summary_by_crop")
+
+fig1_data <- step2 %>%
+  select(crop, pct_negative_NT_lasso, pct_negative_NT_xgb) %>%
+  pivot_longer(cols = c(pct_negative_NT_lasso, pct_negative_NT_xgb),
+               names_to = "nt_type", values_to = "pct_negative") %>%
+  mutate(
+    crop    = factor(crop, levels = crop_order),                                  # fixed crop order (matches palette)
+    nt_type = ifelse(nt_type == "pct_negative_NT_lasso", "LASSO", "XGBoost"),      # readable labels
+    nt_type = factor(nt_type, levels = c("LASSO", "XGBoost"))
+  )
+
+fig1 <- ggplot(fig1_data, aes(x = crop, y = pct_negative, fill = crop, color = crop, alpha = nt_type)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6, linewidth = 0.9) +
+  geom_hline(yintercept = 50, linetype = "dashed", color = "gray40", linewidth = 0.4) +
+  scale_fill_manual(values = crop_pal, guide = "none") +     # fill color = crop's own color
+  scale_color_manual(values = crop_pal, guide = "none") +    # border color = crop's own color
+  # alpha trick: LASSO bars fully opaque fill (solid look), XGBoost bars fully transparent fill (hollow look, only border shows)
+  scale_alpha_manual(values = c("LASSO" = 1, "XGBoost" = 0), guide = "none") +
+  ylab("Share of pairs with negative transfer (%)") +
+  ylim(0, 70) +
+  base_theme
+
+save_figure(fig1, "fig1_pct_negative")
+
+# =========================================================
+# Figure 2: leave-one-crop-out AUROC, oracle feature set
+# (data source: negstep7_output.xlsx, sheet "loco_per_crop_oracle")
+# =========================================================
+
+step7 <- read_excel(file.path(proj_dir, "negstep7_output.xlsx"), sheet = "loco_per_crop_oracle")
+
+fig2_data <- step7 %>%
+  select(nt_column, held_out_crop, auroc) %>%
+  mutate(
+    crop    = factor(held_out_crop, levels = crop_order),
+    nt_type = ifelse(nt_column == "NT_lasso", "LASSO", "XGBoost"),
+    nt_type = factor(nt_type, levels = c("LASSO", "XGBoost"))
+  )
+
+fig2 <- ggplot(fig2_data, aes(x = crop, y = auroc, fill = crop, color = crop, alpha = nt_type)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6, linewidth = 0.9) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "black", linewidth = 0.4) +
+  scale_fill_manual(values = crop_pal, guide = "none") +
+  scale_color_manual(values = crop_pal, guide = "none") +
+  scale_alpha_manual(values = c("LASSO" = 1, "XGBoost" = 0), guide = "none") +
+  ylab("Leave-one-crop-out AUROC") +
+  ylim(0, 0.75) +
+  base_theme
+
+save_figure(fig2, "fig2_loco_auroc")
+
+# ---- A small manual legend explaining solid=LASSO / hollow=XGBoost is needed in the
+# manuscript text (captions), since color here encodes CROP, not model - alpha/fill
+# state is what encodes model, and that is hard to show in a standard ggplot legend
+# without also implying a color legend for crop, which would clutter the figure. ----
+cat("\nFigures saved to:", fig_dir, "\n")
+cat("Reminder: filled bar = LASSO-based NT, hollow (outline-only) bar = XGBoost-based NT, per-crop color per Table 1 / crop_colors.\n")
+
+
+
+
+
+
+
+
+
+
+
+
+
+# =========================================================
+# negatifstep9.R
+# Negative Transfer pilot - Step 9 (APPENDIX / ROBUSTNESS):
+# LogME, a standard transferability-estimation metric from the
+# literature (Li et al. 2021, "LogME: Practical Assessment of
+# Pre-trained Models for Transfer Learning"), adapted to our
+# pooled-regression setting, to check whether an established
+# literature baseline predicts negative transfer any better than
+# the Mahalanobis-distance measures used in Steps 2-7.
+#
+# ADAPTATION NOTE: LogME normally scores how well a pretrained
+# model's learned REPRESENTATION of the target data explains the
+# target labels, without fine-tuning. We do not have learned
+# representations here (no deep network), so we use the natural
+# analogue for a pooled regression setting: the fitted model's
+# own PREDICTION on the target (a 1-dimensional "feature") is
+# scored, via LogME's Bayesian evidence-maximization procedure,
+# against the target's true (log) yield. This requires no
+# retraining beyond what Step 2 already does, and needs no
+# target labels beyond what NT itself already uses.
+#
+# SCOPE NOTE: this step only uses the LASSO model (not XGBoost).
+# LogME's Gaussian-linear evidence framework pairs most naturally
+# with a linear model's output, and restricting to one model
+# keeps this supplementary check's computational cost bounded
+# (it otherwise duplicates all of Step 2's model fitting).
+# =========================================================
+
+library(readxl)    # read xlsx input
+library(openxlsx)  # write xlsx output
+library(dplyr)      # data manipulation
+library(glmnet)     # LASSO
+
+set.seed(42)
+
+# ---- 0. Folder paths (same convention as steps 1-7) ----
+data_dir <- "C:/Users/Alper.Tosun/Desktop/cru130"
+proj_dir <- file.path(data_dir, "negatif_transfer")
+
+# ---- 1. Load step-1 (country roles) and step-2 (NT values, to compare against) ----
+step1_path <- file.path(proj_dir, "negstep1_output.xlsx")
+step2_path <- file.path(proj_dir, "negstep2_output.xlsx")
+
+selection <- read_excel(step1_path, sheet = "selection")   # crop, country, role
+nt_values <- read_excel(step2_path, sheet = "pairwise_results") %>%
+  select(crop, target, candidate, NT_lasso, NT_xgb)
+
+crops_available <- unique(selection$crop)
+cat("Crops:", paste(crops_available, collapse = ", "), "\n")
+
+feature_cols <- c("TMX_ann", "PRE_ann", "GDP_per_Capita")   # same final spec as step 2
+
+# ---- Function: fit LASSO on train_df, return PREDICTIONS on test_df (log-yield scale) ----
+fit_lasso_predict <- function(train_df, test_df) {
+  x_train <- as.matrix(train_df[, feature_cols])
+  y_train <- log(train_df$yield_hg_per_ha)
+  x_test  <- as.matrix(test_df[, feature_cols])
+
+  cvfit <- cv.glmnet(x_train, y_train, alpha = 1, nfolds = 5)
+  as.numeric(predict(cvfit, newx = x_test, s = "lambda.min"))   # predictions, log-yield scale
+}
+
+# ---- Function: LogME for a 1-dimensional "feature" f explaining target y ----
+# Standard evidence-maximization (MacKay-style) Bayesian linear regression,
+# specialized to a single predictor (d = 1), following Li et al. (2021).
+# Returns the per-observation log marginal likelihood (log evidence / n),
+# the paper's own normalization so scores are comparable across sample sizes.
+compute_logme <- function(f, y) {
+  n  <- length(f)
+  ff <- sum(f^2)
+  fy <- sum(f * y)
+
+  alpha <- 1; beta <- 1   # initial precision hyperparameters
+  for (iter in 1:200) {
+    A       <- alpha + beta * ff
+    w_mp    <- beta * fy / A                       # posterior mean weight
+    gamma   <- beta * ff / A                        # effective number of parameters (in [0,1] since d=1)
+    resid   <- sum((y - f * w_mp)^2)
+    alpha_new <- gamma / (w_mp^2 + 1e-8)
+    beta_new  <- (n - gamma) / (resid + 1e-8)
+    if (abs(alpha_new - alpha) < 1e-6 && abs(beta_new - beta) < 1e-6) {
+      alpha <- alpha_new; beta <- beta_new
+      break
+    }
+    alpha <- alpha_new; beta <- beta_new
+  }
+
+  A     <- alpha + beta * ff
+  w_mp  <- beta * fy / A
+  resid <- sum((y - f * w_mp)^2)
+
+  logme <- 0.5 * n * log(beta) - 0.5 * n * log(2 * pi) +
+           0.5 * log(alpha) - 0.5 * log(A) -
+           0.5 * beta * resid - 0.5 * alpha * w_mp^2
+
+  logme / n   # normalized, per the original paper's convention
+}
+
+# ---- Process a single crop: compute delta-LogME for every (target, candidate) pair ----
+process_crop_step9 <- function(crop_name) {
+
+  cat("\n----", toupper(crop_name), "----\n")
+
+  file_path <- file.path(data_dir, paste0("panelv7_", crop_name, ".xlsx"))
+  if (!file.exists(file_path)) {
+    cat("WARNING:", file_path, "not found, skipping this crop.\n")
+    return(NULL)
+  }
+  df <- read_excel(file_path) %>%
+    filter(complete.cases(select(., all_of(c("yield_hg_per_ha", feature_cols)))))
+
+  sel_crop <- selection %>% filter(crop == crop_name)
+  target_countries    <- sel_crop$country[sel_crop$role == "target"]
+  pool_countries       <- sel_crop$country[sel_crop$role == "pool"]
+  candidate_countries  <- sel_crop$country[sel_crop$role == "candidate"]
+
+  pool_data <- df %>% filter(Country_ISO %in% pool_countries)
+
+  results <- list()
+
+  for (t in target_countries) {
+
+    test_data <- df %>% filter(Country_ISO == t)
+    if (nrow(test_data) < 5) next
+    y_t <- log(test_data$yield_hg_per_ha)
+
+    # ---- baseline: predictions from a model trained on S only ----
+    f_S <- fit_lasso_predict(pool_data, test_data)
+    logme_S <- compute_logme(f_S, y_t)
+
+    for (s in candidate_countries) {
+
+      cand_data <- df %>% filter(Country_ISO == s)
+      if (nrow(cand_data) < 5) next
+
+      train_plus_s <- bind_rows(pool_data, cand_data)
+      f_Ss <- fit_lasso_predict(train_plus_s, test_data)
+      logme_Ss <- compute_logme(f_Ss, y_t)
+
+      results[[length(results) + 1]] <- data.frame(
+        crop      = crop_name,
+        target    = t,
+        candidate = s,
+        logme_S   = logme_S,
+        logme_Ss  = logme_Ss,
+        delta_logme = logme_Ss - logme_S   # positive = candidate improved evidence (helpful), matches NT sign convention
+      )
+    }
+    cat("  target", t, "done (", length(candidate_countries), "candidates )\n")
+  }
+
+  bind_rows(results)
+}
+
+# ---- Run for every crop ----
+logme_all <- bind_rows(lapply(crops_available, process_crop_step9))
+
+# ---- Join against Step 2's NT values ----
+combined <- logme_all %>%
+  left_join(nt_values, by = c("crop", "target", "candidate"))
+
+cat("\nTotal pairs with delta-LogME:", nrow(combined), "\n")
+
+# ---- Does delta-LogME predict NT? (Spearman correlation, same style as step 3) ----
+summary_tbl <- combined %>%
+  group_by(crop) %>%
+  summarise(
+    n_pairs                       = n(),
+    spearman_deltaLogME_vs_NT_lasso = cor(delta_logme, NT_lasso, method = "spearman"),
+    spearman_deltaLogME_vs_NT_xgb   = cor(delta_logme, NT_xgb,   method = "spearman"),
+    .groups = "drop"
+  )
+
+overall_row <- combined %>%
+  summarise(
+    crop = "ALL_CROPS_POOLED",
+    n_pairs = n(),
+    spearman_deltaLogME_vs_NT_lasso = cor(delta_logme, NT_lasso, method = "spearman"),
+    spearman_deltaLogME_vs_NT_xgb   = cor(delta_logme, NT_xgb,   method = "spearman")
+  )
+
+summary_tbl <- bind_rows(summary_tbl, overall_row)
+print(summary_tbl)
+
+# ---- AUROC: does delta-LogME rank-separate negative-transfer pairs from the rest? ----
+# (rank-based AUROC, same helper as previous steps, no extra package needed)
+auroc <- function(scores, labels) {
+  n1 <- sum(labels == 1); n0 <- sum(labels == 0)
+  if (n1 == 0 || n0 == 0) return(NA)
+  r <- rank(scores)
+  (sum(r[labels == 1]) - n1 * (n1 + 1) / 2) / (n1 * n0)
+}
+
+auroc_tbl <- data.frame(
+  nt_column = c("NT_lasso", "NT_xgb"),
+  auroc_deltaLogME = c(
+    auroc(combined$delta_logme, as.integer(combined$NT_lasso < 0)),
+    auroc(combined$delta_logme, as.integer(combined$NT_xgb   < 0))
+  )
+)
+print(auroc_tbl)
+
+# ---- Save everything as Excel (no RDS) ----
+out_path <- file.path(proj_dir, "negstep9_output.xlsx")
+
+wb <- createWorkbook()
+addWorksheet(wb, "pairwise_deltaLogME")     # every (target, candidate) row with delta-LogME and NT
+addWorksheet(wb, "spearman_by_crop")        # per-crop + overall Spearman correlation
+addWorksheet(wb, "auroc_summary")           # pooled AUROC: does delta-LogME rank-separate NT<0 pairs?
+
+writeData(wb, "pairwise_deltaLogME", combined)
+writeData(wb, "spearman_by_crop", summary_tbl)
+writeData(wb, "auroc_summary", auroc_tbl)
+
+saveWorkbook(wb, out_path, overwrite = TRUE)
+
+cat("\nStep 9 complete. Output saved to:\n", out_path, "\n")
+
+
+
+
+
+
+
+
+
+
+
+
+
+# =========================================================
+# negatifstep10.R
+# Negative Transfer pilot - Step 10 (APPENDIX / ROBUSTNESS,
+# continued): leave-one-crop-out (LOCO) validation and a
+# crop-stratified permutation test for delta-LogME (Step 9),
+# using the exact same protocol already applied to the
+# Mahalanobis-distance predictors in Steps 5 and 7. This is
+# a cheap addition: it re-reads Step 9's already-computed
+# delta-LogME values and does not refit any LASSO models.
+# =========================================================
+
+library(readxl)    # read xlsx input
+library(openxlsx)  # write xlsx output
+library(dplyr)      # data manipulation
+library(xgboost)    # nonlinear classifier (single-feature, for consistency with steps 5/7)
+
+set.seed(42)
+
+# ---- 0. Folder paths (same convention as steps 1-9) ----
+data_dir <- "C:/Users/Alper.Tosun/Desktop/cru130"
+proj_dir <- file.path(data_dir, "negatif_transfer")
+
+# ---- 1. Load step-9 output ----
+step9_path <- file.path(proj_dir, "negstep9_output.xlsx")
+feat <- read_excel(step9_path, sheet = "pairwise_deltaLogME")   # crop, target, candidate, logme_S, logme_Ss, delta_logme, NT_lasso, NT_xgb
+
+crops_in_feat <- unique(feat$crop)
+cat("Crops:", paste(crops_in_feat, collapse = ", "), "\n")
+
+feature_cols <- c("delta_logme")   # single feature, consistent with how D_mahalanobis alone was tested
+
+# ---- AUROC / PR-AUC helpers (same as previous steps) ----
+auroc <- function(scores, labels) {
+  n1 <- sum(labels == 1); n0 <- sum(labels == 0)
+  if (n1 == 0 || n0 == 0) return(NA)
+  r <- rank(scores)
+  (sum(r[labels == 1]) - n1 * (n1 + 1) / 2) / (n1 * n0)
+}
+pr_auc <- function(scores, labels) {
+  ord <- order(-scores)
+  lab <- labels[ord]
+  tp <- cumsum(lab); fp <- cumsum(1 - lab)
+  precision <- tp / (tp + fp); recall <- tp / sum(lab)
+  auc <- 0; prev_r <- 0; prev_p <- 1
+  for (i in seq_along(recall)) {
+    auc <- auc + (recall[i] - prev_r) * (precision[i] + prev_p) / 2
+    prev_r <- recall[i]; prev_p <- precision[i]
+  }
+  auc
+}
+
+# ---- LOCO with delta_logme as the sole predictor ----
+run_loco <- function(nt_col) {
+  y_all <- as.integer(feat[[nt_col]] < 0)
+  x_all <- as.matrix(feat[, feature_cols, drop = FALSE])
+  crops_here <- unique(feat$crop)
+
+  oof_pred <- numeric(nrow(feat))
+  per_crop <- list()
+
+  for (held_out in crops_here) {
+    train_idx <- which(feat$crop != held_out)
+    test_idx  <- which(feat$crop == held_out)
+    if (length(test_idx) == 0) next
+
+    model <- xgboost(x = x_all[train_idx, , drop = FALSE], y = factor(y_all[train_idx]),
+                      nrounds = 100, max_depth = 3, learning_rate = 0.1,
+                      objective = "binary:logistic")
+    pred <- predict(model, x_all[test_idx, , drop = FALSE])
+    oof_pred[test_idx] <- pred
+
+    per_crop[[held_out]] <- data.frame(
+      nt_column = nt_col, held_out_crop = held_out, n_test = length(test_idx),
+      auroc = auroc(pred, y_all[test_idx]), pr_auc = pr_auc(pred, y_all[test_idx])
+    )
+  }
+
+  list(
+    per_crop = bind_rows(per_crop),
+    oof_pred = oof_pred,
+    y_all    = y_all
+  )
+}
+
+# ---- Permutation test (stratified by crop) - identical protocol to step 7 ----
+# CORRECTED AFTER REVIEW: same fix as Step 7's permutation_test() - the
+# p-value is now computed from each permuted statistic's distance from the
+# null distribution's OWN mean (continuity-corrected), not from a fixed
+# distance-from-0.5 comparison, which is only valid when the null happens
+# to be centered at 0.5. The old, uncorrected p-value is kept alongside for
+# comparison. Step 10's null means (~0.50, ~0.498, per the original run)
+# are already close to 0.5, so this correction is expected to have little
+# numerical effect here - unlike in Step 7 - but we apply it for
+# consistency and to confirm that expectation rather than assume it.
+permutation_test <- function(oof_pred, y_all, crop_vec, n_perm = 500) {
+  observed <- auroc(oof_pred, y_all)
+  perm_stats <- numeric(n_perm)
+  for (p in 1:n_perm) {
+    y_perm <- y_all
+    for (c in unique(crop_vec)) {
+      idx <- which(crop_vec == c)
+      y_perm[idx] <- sample(y_all[idx])
+    }
+    perm_stats[p] <- auroc(oof_pred, y_perm)
+  }
+  null_mean <- mean(perm_stats)
+  p_value_old_uncorrected <- mean(abs(perm_stats - 0.5) >= abs(observed - 0.5))
+  exceed <- sum(abs(perm_stats - null_mean) >= abs(observed - null_mean))
+  p_value <- (exceed + 1) / (n_perm + 1)
+  list(observed = observed, p_value = p_value, p_value_old_uncorrected = p_value_old_uncorrected,
+       perm_mean = null_mean, perm_sd = sd(perm_stats), perm_stats = perm_stats)
+}
+
+# ---- Run everything ----
+res_lasso <- run_loco("NT_lasso")
+res_xgb   <- run_loco("NT_xgb")
+
+perm_lasso <- permutation_test(res_lasso$oof_pred, res_lasso$y_all, feat$crop)
+perm_xgb   <- permutation_test(res_xgb$oof_pred,   res_xgb$y_all,   feat$crop)
+
+summary_tbl <- bind_rows(
+  data.frame(nt_column = "NT_lasso", observed_auroc = perm_lasso$observed,
+             permutation_p_value = perm_lasso$p_value,
+             permutation_p_value_OLD_uncorrected = perm_lasso$p_value_old_uncorrected,
+             null_mean = perm_lasso$perm_mean, null_sd = perm_lasso$perm_sd),
+  data.frame(nt_column = "NT_xgb", observed_auroc = perm_xgb$observed,
+             permutation_p_value = perm_xgb$p_value,
+             permutation_p_value_OLD_uncorrected = perm_xgb$p_value_old_uncorrected,
+             null_mean = perm_xgb$perm_mean, null_sd = perm_xgb$perm_sd)
+)
+
+cat("\n--- delta-LogME: LOCO permutation test summary (permutation_p_value is CORRECTED; permutation_p_value_OLD_uncorrected is the original, flawed formula) ---\n")
+print(summary_tbl)
+
+per_crop_all <- bind_rows(res_lasso$per_crop, res_xgb$per_crop)
+cat("\n--- delta-LogME: per-crop LOCO results ---\n")
+print(per_crop_all)
+
+# DIAGNOSTIC ADDITION (matching Step 7): save the full null distribution so
+# its shape can be inspected directly, not just its mean/sd.
+null_distributions <- data.frame(
+  permutation_index = 1:500,
+  NT_lasso_null_auroc = perm_lasso$perm_stats,
+  NT_xgb_null_auroc   = perm_xgb$perm_stats
+)
+
+# ---- Save everything as Excel (no RDS) ----
+out_path <- file.path(proj_dir, "negstep10_output.xlsx")
+
+wb <- createWorkbook()
+addWorksheet(wb, "permutation_summary")   # observed AUROC vs. null distribution, p-value (both corrected and old)
+addWorksheet(wb, "loco_per_crop")         # per-crop LOCO AUROC/PR-AUC for delta_logme
+addWorksheet(wb, "null_distributions")    # DIAGNOSTIC ADDITION: all 500 permuted AUROC values per NT definition
+
+writeData(wb, "permutation_summary", summary_tbl)
+writeData(wb, "loco_per_crop", per_crop_all)
+writeData(wb, "null_distributions", null_distributions)
+
+saveWorkbook(wb, out_path, overwrite = TRUE)
+
+cat("\nStep 10 complete. Output saved to:\n", out_path, "\n")
+
+
+
+
+# =========================================================
+# negatifstep11.R
+# Negative Transfer pilot - Step 11 (ROBUSTNESS): pool-size and
+# random-seed sensitivity of the headline negative-transfer
+# prevalence statistic.
+#
+# MOTIVATION: the main pipeline (Steps 1-2) builds exactly one
+# fixed source pool per crop, with N = 20 and seed = 42. Because
+# NT(s | S, t) is explicitly conditional on S, the prevalence of
+# negative transfer could in principle depend heavily on pool
+# size or on which particular 20 countries happened to be drawn.
+# This step re-runs the SAME country-selection and NT-computation
+# logic as Steps 1-2, across a small grid of pool sizes (N) and
+# random seeds, and reports whether the ~45-48% prevalence figure
+# is stable or highly sensitive to these design choices.
+#
+# SCOPE NOTE: this only re-checks the PREVALENCE statistic (Step
+# 2's headline number), not the full LOCO predictability analysis
+# (Steps 4-7) - re-running the complete predictability pipeline
+# for every (N, seed) combination would multiply total runtime by
+# roughly 8x on top of an already long pipeline. Re-testing
+# predictability across pool sizes is a natural next step if this
+# prevalence check reveals instability.
+#
+# COST WARNING: this step refits LASSO (and, unless disabled
+# below, XGBoost) for every (target, candidate) pair, for every
+# crop, for every configuration in the grid below. This is
+# comparable in cost to running Step 2 once per grid row. If this
+# is too slow, set RUN_XGB <- FALSE below to use LASSO only for
+# this sensitivity check (XGBoost is the slower of the two fits).
+# =========================================================
+
+library(readxl)    # read xlsx input
+library(openxlsx)  # write xlsx output
+library(dplyr)      # data manipulation
+library(glmnet)     # LASSO
+library(xgboost)    # XGBoost
+
+# ---- 0. Folder paths (same convention as steps 1-10) ----
+data_dir <- "C:/Users/Alper.Tosun/Desktop/cru130"
+proj_dir <- file.path(data_dir, "negatif_transfer")
+
+# reset feature_cols in case an earlier step in this file left a different value behind
+feature_cols <- c("TMX_ann", "PRE_ann", "GDP_per_Capita")
+
+RUN_XGB <- TRUE   # set to FALSE to skip XGBoost and only compute LASSO-based NT (faster)
+
+crops_all <- c("wheat", "barley", "oats", "rye", "rice", "maize", "soybean", "sorghum")
+
+# ---- Sensitivity grid ----
+# Axis 1: pool size, seed held at the pipeline's default (42)
+pool_size_grid <- data.frame(N_pool = c(10, 20, 40, 60), seed = 42)
+# Axis 2: random seed, pool size held at the pipeline's default (20)
+seed_grid <- data.frame(N_pool = 20, seed = c(7, 17, 91, 123))
+# (N_pool=20, seed=42) is the pipeline's original configuration and appears in
+# both grids by construction, so results from Step 2 can be cross-checked here.
+config_grid <- bind_rows(pool_size_grid, seed_grid) %>% distinct()
+cat("Configurations to test:\n"); print(config_grid)
+
+# ---- Function: build target/pool/candidate selection for one crop, given (seed, N_pool) ----
+# Same logic as Step 1, parameterized.
+build_selection_for_config <- function(crop_name, seed, N_pool) {
   set.seed(seed)
-  cluster_louvain(gr, weights = E(gr)$weight)
-}
 
-country_fingerprint <- function(crop_name) {                               # mean climate/GDP per country (full panel)
-  read_panel(crop_name) %>%
+  file_path <- file.path(data_dir, paste0("panelv7_", crop_name, ".xlsx"))
+  if (!file.exists(file_path)) return(NULL)
+  df <- read_excel(file_path)
+
+  obs_count <- df %>%
     group_by(Country_ISO) %>%
-    summarise(TMX = mean(TMX_ann, na.rm = TRUE), PRE = mean(PRE_ann, na.rm = TRUE),
-              GDP = mean(GDP_per_Capita, na.rm = TRUE), .groups = "drop") %>%
-    filter(!is.na(TMX), !is.na(PRE), !is.na(GDP))
-}
+    summarise(n_obs = sum(!is.na(yield_hg_per_ha)), .groups = "drop")
+  eligible_countries <- obs_count %>% filter(n_obs >= 30) %>% pull(Country_ISO)
+  df_elig <- df %>% filter(Country_ISO %in% eligible_countries)
 
-adjusted_rand_index <- function(a, b) {                                    # Adjusted Rand Index between two partitions
-  tab <- table(a, b); n <- sum(tab)
-  sum_rows <- sum(choose(rowSums(tab), 2)); sum_cols <- sum(choose(colSums(tab), 2))
-  expected <- (sum_rows * sum_cols) / choose(n, 2)
-  as.numeric((sum(choose(tab, 2)) - expected) / (0.5 * (sum_rows + sum_cols) - expected))  # plain number
-}
+  fingerprint <- df_elig %>%
+    group_by(Country_ISO) %>%
+    summarise(
+      mean_TMX = mean(TMX_ann, na.rm = TRUE), sd_TMX = sd(TMX_ann, na.rm = TRUE),
+      mean_PRE = mean(PRE_ann, na.rm = TRUE), sd_PRE = sd(PRE_ann, na.rm = TRUE),
+      mean_GDP = mean(GDP_per_Capita, na.rm = TRUE), .groups = "drop"
+    ) %>%
+    filter(complete.cases(.))
 
-normalized_mutual_info <- function(a, b) {                                 # NMI (arithmetic-mean normalisation)
-  tab <- table(a, b); n <- sum(tab); pij <- tab / n
-  pi_ <- rowSums(pij); pj_ <- colSums(pij); mi <- 0
-  for (i in seq_len(nrow(tab))) for (j in seq_len(ncol(tab)))
-    if (pij[i, j] > 0) mi <- mi + pij[i, j] * log(pij[i, j] / (pi_[i] * pj_[j]))
-  hi <- -sum(pi_[pi_ > 0] * log(pi_[pi_ > 0])); hj <- -sum(pj_[pj_ > 0] * log(pj_[pj_ > 0]))
-  as.numeric(2 * mi / (hi + hj))                                           # plain number (no names)
-}
+  if (nrow(fingerprint) < N_pool + 10) return(NULL)   # not enough countries for this pool size + targets + candidates
 
-eta_squared <- function(values, groups) {                                  # share of variance explained by community
-  d <- data.frame(v = values, g = groups) %>% filter(!is.na(v), !is.na(g))
-  gm <- mean(d$v); sst <- sum((d$v - gm)^2)                                # grand mean, total sum of squares
-  ssb <- d %>% group_by(g) %>% summarise(n = n(), m = mean(v), .groups = "drop") %>%
-    summarise(ss = sum(n * (m - gm)^2)) %>% pull(ss)                       # between-community sum of squares
-  ssb / sst
-}
+  fp_scaled <- scale(fingerprint[, c("mean_TMX","sd_TMX","mean_PRE","sd_PRE","mean_GDP")])
+  km <- kmeans(fp_scaled, centers = 5, nstart = 25)
 
-random_degseq_graph <- function(deg) {                                     # works across igraph versions
-  tryCatch(sample_degseq(deg, method = "simple"),                          # igraph >= 2.0 name
-           error = function(e) sample_degseq(deg, method = "configuration")) # older igraph name
-}
+  target_countries <- character(5)
+  for (k in 1:5) {
+    idx_in_cluster <- which(km$cluster == k)
+    centroid <- km$centers[k, ]
+    dists <- apply(fp_scaled[idx_in_cluster, , drop = FALSE], 1, function(row) sqrt(sum((row - centroid)^2)))
+    target_countries[k] <- fingerprint$Country_ISO[idx_in_cluster[which.min(dists)]]
+  }
 
-partition_agreement <- function(m_a, m_b) {                                # ARI + NMI on nodes present in both partitions
-  common <- intersect(names(m_a), names(m_b))
-  c(ARI = adjusted_rand_index(m_a[common], m_b[common]),
-    NMI = normalized_mutual_info(m_a[common], m_b[common]))
-}
-
-# =============================================================================
-# STEP 1 -- Negative-transfer computation (HEAVY)
-# =============================================================================
-run_one_crop_repeat <- function(crop_name, repeat_id, seed_val, ps = pool_size) {
-  set.seed(seed_val)                                                       # reproducible per (crop, repeat)
-  df <- prep_panel(crop_name)
-  countries <- unique(df$Country_ISO)
-  cat(sprintf("[%s | repeat %d | pool %d] %d eligible countries\n", crop_name, repeat_id, ps, length(countries)))
-  out_rows <- list()
-  for (t in countries) {                                                   # every country takes a turn as target
-    others <- setdiff(countries, t)
-    pool <- sample(others, min(ps, length(others)))                        # this target's random background pool
-    candidates <- setdiff(others, pool)                                    # everyone else is a candidate source
-    target_df <- df %>% filter(Country_ISO == t)
-    pool_df   <- df %>% filter(Country_ISO %in% pool)
-    base_rmse <- fit_and_rmse(pool_df, target_df)                          # baseline: pool only
-    for (s in candidates) {
-      ext_df <- bind_rows(pool_df, df %>% filter(Country_ISO == s))        # pool + one candidate
-      ext_rmse <- fit_and_rmse(ext_df, target_df)
-      out_rows[[length(out_rows) + 1]] <- data.frame(
-        crop = crop_name, repeat_id = repeat_id, target = t, candidate = s,
-        NT_lasso = unname(base_rmse["lasso"] - ext_rmse["lasso"]),         # NT > 0: candidate helped
-        NT_xgb   = unname(base_rmse["xgb"]   - ext_rmse["xgb"]))
+  pool_candidates_fp <- fingerprint %>% filter(!Country_ISO %in% target_countries)
+  pool_clusters <- km$cluster[match(pool_candidates_fp$Country_ISO, fingerprint$Country_ISO)]
+  pool_countries <- character(0)
+  n_per_cluster <- round(N_pool * table(pool_clusters) / length(pool_clusters))
+  for (k in unique(pool_clusters)) {
+    cluster_pool <- pool_candidates_fp$Country_ISO[pool_clusters == k]
+    n_take <- min(n_per_cluster[as.character(k)], length(cluster_pool))
+    pool_countries <- c(pool_countries, sample(cluster_pool, n_take))
+  }
+  if (length(pool_countries) > N_pool) {
+    pool_countries <- sample(pool_countries, N_pool)
+  } else if (length(pool_countries) < N_pool) {
+    remaining <- setdiff(pool_candidates_fp$Country_ISO, pool_countries)
+    if (length(remaining) >= N_pool - length(pool_countries)) {
+      extra <- sample(remaining, N_pool - length(pool_countries))
+      pool_countries <- c(pool_countries, extra)
     }
   }
-  bind_rows(out_rows)
+
+  candidate_countries <- fingerprint$Country_ISO[!fingerprint$Country_ISO %in% c(target_countries, pool_countries)]
+
+  list(df = df, target_countries = target_countries, pool_countries = pool_countries,
+       candidate_countries = candidate_countries)
 }
 
-step1 <- function() {
-  if (SKIP_IF_DONE["step1"] && file.exists(step1_file)) { cat("Step 1: output exists -> skipped\n"); return(invisible()) }
-  load_model_libs(); smoke_test_models()
-  all_res <- list(); t0 <- Sys.time()
-  for (crop_name in crops) for (r in seq_len(n_repeats)) {
-    rep_file <- out_file(sprintf("networkstep1_%s_rep%d.xlsx", crop_name, r))
-    if (file.exists(rep_file)) {                                           # resume support after an interruption
-      res <- read_excel(rep_file); cat("Loaded existing", basename(rep_file), "\n")
-    } else {
-      res <- run_one_crop_repeat(crop_name, r, 1000 * seed_index(crop_name) + r)
-      write_xlsx(res, rep_file)                                            # save every (crop, repeat) separately
+# ---- Function: compute NT prevalence for one crop, given a selection ----
+compute_prevalence_for_crop <- function(crop_name, sel) {
+  df <- sel$df %>% filter(complete.cases(select(., all_of(c("yield_hg_per_ha", feature_cols)))))
+  pool_data <- df %>% filter(Country_ISO %in% sel$pool_countries)
+
+  nt_lasso_vals <- c(); nt_xgb_vals <- c()
+
+  for (t in sel$target_countries) {
+    test_data <- df %>% filter(Country_ISO == t)
+    if (nrow(test_data) < 5) next
+
+    rmse_base_lasso <- fit_lasso_rmse(pool_data, test_data)
+    if (RUN_XGB) rmse_base_xgb <- fit_xgb_rmse(pool_data, test_data)
+
+    for (s in sel$candidate_countries) {
+      cand_data <- df %>% filter(Country_ISO == s)
+      if (nrow(cand_data) < 5) next
+      train_plus_s <- bind_rows(pool_data, cand_data)
+
+      rmse_add_lasso <- fit_lasso_rmse(train_plus_s, test_data)
+      nt_lasso_vals <- c(nt_lasso_vals, rmse_base_lasso - rmse_add_lasso)
+
+      if (RUN_XGB) {
+        rmse_add_xgb <- fit_xgb_rmse(train_plus_s, test_data)
+        nt_xgb_vals <- c(nt_xgb_vals, rmse_base_xgb - rmse_add_xgb)
+      }
     }
-    all_res[[length(all_res) + 1]] <- res
-    cat(sprintf("Done: %s repeat %d | elapsed %.1f min\n", crop_name, r, as.numeric(difftime(Sys.time(), t0, units = "mins"))))
   }
-  write_xlsx(bind_rows(all_res), step1_file)
-  cat("Step 1 finished in", round(as.numeric(difftime(Sys.time(), t0, units = "hours")), 2), "hours\n")
+
+  data.frame(
+    crop = crop_name,
+    n_pairs = length(nt_lasso_vals),
+    pct_negative_lasso = if (length(nt_lasso_vals) > 0) mean(nt_lasso_vals < 0) * 100 else NA,
+    pct_negative_xgb    = if (RUN_XGB && length(nt_xgb_vals) > 0) mean(nt_xgb_vals < 0) * 100 else NA
+  )
 }
 
-# =============================================================================
-# STEP 2 -- Community detection, null model 1, ARI/NMI vs climate/GDP clusters
-# =============================================================================
-step2 <- function() {
-  s1 <- read_step1(); rows <- list()
-  for (crop_name in crops) for (metric in metrics) {
-    sd0 <- 2000 + 10 * seed_index(crop_name) + (metric == "NT_xgb")        # deterministic seed per (crop, metric)
-    gr <- build_graph(s1, crop_name, metric)
-    comm <- louvain(gr, sd0)
-    real_mod <- modularity(gr, membership(comm), weights = E(gr)$weight)   # observed modularity
-    w_vec <- E(gr)$weight; set.seed(sd0 + 1)
-    null_mods <- numeric(n_null)
-    for (i in seq_len(n_null)) {                                           # null 1: same topology, shuffled weights
-      g2 <- gr; E(g2)$weight <- sample(w_vec)
-      m2 <- cluster_louvain(g2, weights = E(g2)$weight)
-      null_mods[i] <- modularity(g2, membership(m2), weights = E(g2)$weight)
+# ---- Run the full grid ----
+all_config_results <- list()
+
+for (i in seq_len(nrow(config_grid))) {
+  N_pool <- config_grid$N_pool[i]
+  seed   <- config_grid$seed[i]
+  cat("\n=== Config", i, "/", nrow(config_grid), ": N_pool =", N_pool, ", seed =", seed, "===\n")
+
+  crop_results <- list()
+  for (crop_name in crops_all) {
+    sel <- build_selection_for_config(crop_name, seed, N_pool)
+    if (is.null(sel)) {
+      cat("  ", crop_name, ": skipped (not enough eligible countries for N_pool =", N_pool, ")\n")
+      next
     }
-    n_ge <- sum(null_mods >= real_mod)                                     # draws that met/exceeded observed value
-    fp <- country_fingerprint(crop_name) %>% filter(Country_ISO %in% V(gr)$name)
-    set.seed(sd0 + 2)
-    km <- kmeans(scale(fp[, c("TMX", "PRE", "GDP")]), centers = 5, nstart = 10)  # climate/GDP clusters
-    common <- intersect(V(gr)$name, fp$Country_ISO)
-    lab_l <- membership(comm)[common]; lab_c <- km$cluster[match(common, fp$Country_ISO)]
-    rows[[length(rows) + 1]] <- data.frame(
-      crop = crop_name, metric = metric, N_nodes = vcount(gr),
-      N_communities = length(unique(membership(comm))),
-      modularity_real = real_mod, modularity_null_mean = mean(null_mods),
-      n_null_ge = n_ge, p_value = n_ge / n_null,                           # raw empirical p (0 means p < 1/n_null)
-      p_plus1 = (n_ge + 1) / (n_null + 1),                                 # (k+1)/(B+1) never-zero version
-      ARI_vs_climate = adjusted_rand_index(lab_c, lab_l), NMI_vs_climate = normalized_mutual_info(lab_c, lab_l))
-    cat("Step 2:", crop_name, metric, "done\n")
+    res <- compute_prevalence_for_crop(crop_name, sel)
+    crop_results[[crop_name]] <- res
+    cat("  ", crop_name, ": pct_negative_lasso =", round(res$pct_negative_lasso, 1),
+        if (RUN_XGB) paste0(", pct_negative_xgb = ", round(res$pct_negative_xgb, 1)) else "", "\n")
   }
-  res <- bind_rows(rows); write_xlsx(res, out_file("networkstep2_output.xlsx")); print(res)
-}
 
-# =============================================================================
-# STEP 3 -- Mechanism analysis: raw vs partial source-target correlation
-# =============================================================================
-step3 <- function() {
-  s1 <- read_step1(); rows <- list()
-  for (crop_name in crops) {
-    avg <- s1 %>% filter(crop == crop_name) %>% group_by(target, candidate) %>%
-      summarise(NT_lasso = mean(NT_lasso), .groups = "drop")               # R-averaged NT
-    stats <- read_panel(crop_name) %>% group_by(Country_ISO) %>%
-      summarise(yield_std = sd(.data[[y_col]], na.rm = TRUE),              # native yield volatility
-                gdp_mean = mean(GDP_per_Capita, na.rm = TRUE), .groups = "drop")
-    src <- avg %>% group_by(candidate) %>% summarise(source_sig = mean(NT_lasso), .groups = "drop")  # effect as a source
-    tgt <- avg %>% group_by(target)    %>% summarise(target_sig = mean(NT_lasso), .groups = "drop")  # effect as a target
-    df <- stats %>% inner_join(src, by = c("Country_ISO" = "candidate")) %>%
-      inner_join(tgt, by = c("Country_ISO" = "target")) %>%
-      filter(if_all(c(yield_std, gdp_mean, source_sig, target_sig), ~ !is.na(.)))
-    raw_corr <- cor(df$source_sig, df$target_sig)                          # unadjusted correlation
-    r_s <- residuals(lm(source_sig ~ yield_std + gdp_mean, data = df))     # remove volatility + GDP from source signal
-    r_t <- residuals(lm(target_sig ~ yield_std + gdp_mean, data = df))     # ... and from target signal
-    partial_corr <- cor(r_s, r_t)
-    rows[[length(rows) + 1]] <- data.frame(
-      crop = crop_name, N = nrow(df), raw_corr = raw_corr, partial_corr = partial_corr,
-      change = ifelse(sign(raw_corr) != sign(partial_corr), "sign flip",
-                      ifelse(abs(partial_corr) > abs(raw_corr), "grows", "shrinks")),
-      corr_yieldstd_source = cor(df$yield_std, df$source_sig),
-      corr_gdp_source = cor(df$gdp_mean, df$source_sig), corr_gdp_target = cor(df$gdp_mean, df$target_sig))
+  crop_tbl <- bind_rows(crop_results)
+  if (nrow(crop_tbl) > 0) {
+    # NOTE (bugfix): n_pairs must be summed LAST. dplyr::summarise() evaluates
+    # arguments sequentially within one call, so if n_pairs = sum(n_pairs) came
+    # before the weighted.mean() calls below, those calls would see the
+    # already-overwritten (length-1) n_pairs instead of the original per-crop
+    # vector, causing a "'x' and 'w' must have the same length" error.
+    overall <- crop_tbl %>%
+      summarise(
+        crop = "ALL_CROPS_POOLED",
+        pct_negative_lasso = weighted.mean(pct_negative_lasso, n_pairs, na.rm = TRUE),
+        pct_negative_xgb    = if (RUN_XGB) weighted.mean(pct_negative_xgb, n_pairs, na.rm = TRUE) else NA,
+        n_pairs = sum(n_pairs)
+      )
+    crop_tbl <- bind_rows(crop_tbl, overall)
   }
-  res <- bind_rows(rows); write_xlsx(res, out_file("networkstep3_output.xlsx")); print(res)
-  print(table(res$change))
+  crop_tbl$N_pool <- N_pool
+  crop_tbl$seed   <- seed
+  all_config_results[[i]] <- crop_tbl
 }
 
-# =============================================================================
-# STEP 4 -- Eta-squared: GDP vs climate, majority vote over 5 Louvain seeds
-# =============================================================================
-step4 <- function() {
-  s1 <- read_step1(); rows <- list()
-  for (crop_name in crops) {
-    gr <- build_graph(s1, crop_name, "NT_lasso")
-    fp <- country_fingerprint(crop_name) %>% filter(Country_ISO %in% V(gr)$name)
-    votes <- logical(5); eg1 <- et1 <- NA
-    for (s in 1:5) {
-      mv <- membership(louvain(gr, s))[fp$Country_ISO]                     # community of each country under seed s
-      eg <- eta_squared(fp$GDP, mv); et <- eta_squared(fp$TMX, mv)
-      votes[s] <- eg > et                                                  # does GDP beat climate under this seed?
-      if (s == 1) { eg1 <- eg; et1 <- et }                                 # report seed-1 values in the table
-    }
-    rows[[length(rows) + 1]] <- data.frame(
-      crop = crop_name, eta2_GDP_seed1 = eg1, eta2_TMX_seed1 = et1, GDP_higher_seed1 = eg1 > et1,
-      n_seeds_GDP_higher = sum(votes), stable_across_5_seeds = sum(votes) %in% c(0, 5),
-      GDP_higher_majority = sum(votes) >= 3)
-  }
-  res <- bind_rows(rows); write_xlsx(res, out_file("networkstep4_eta_output.xlsx")); print(res)
-}
+results_all <- bind_rows(all_config_results)
+cat("\n--- Full sensitivity grid results ---\n")
+print(results_all)
 
-# =============================================================================
-# STEP 5 -- Pool-size sensitivity pilot (HEAVY)
-# =============================================================================
-step5 <- function() {
-  f5 <- out_file("networkstep5_poolsize_summary.xlsx")
-  if (SKIP_IF_DONE["step5"] && file.exists(f5)) { cat("Step 5: output exists -> skipped\n"); return(invisible()) }
-  load_model_libs(); smoke_test_models()
-  crops5 <- c("wheat", "rye", "sorghum"); pool_sizes <- c(10, 15, 20)     # one strong, two weak crops
-  summ <- list(); t0 <- Sys.time()
-  for (crop_name in crops5) for (ps in pool_sizes) {
-    nt_file <- out_file(sprintf("networkstep5_nt_%s_pool%d.xlsx", crop_name, ps))
-    if (file.exists(nt_file)) { nt <- read_excel(nt_file) } else {         # resume support
-      nt <- run_one_crop_repeat(crop_name, 1, 5000 + 100 * seed_index(crop_name) + ps, ps = ps)
-      write_xlsx(nt, nt_file)
-    }
-    g_df <- nt %>% group_by(target, candidate) %>% summarise(w = mean(NT_lasso), .groups = "drop") %>% filter(w > 0)
-    gr <- graph_from_data_frame(g_df %>% transmute(from = candidate, to = target, weight = w), directed = FALSE)
-    gr <- simplify(gr, edge.attr.comb = list(weight = "sum"))
-    comm <- louvain(gr, 1)
-    fp <- country_fingerprint(crop_name) %>% filter(Country_ISO %in% V(gr)$name)
-    mv <- membership(comm)[fp$Country_ISO]
-    summ[[length(summ) + 1]] <- data.frame(
-      crop = crop_name, pool_size = ps, n_pairs = nrow(nt), share_NT_lasso_negative = mean(nt$NT_lasso < 0),
-      N_communities = length(unique(membership(comm))),
-      modularity = modularity(gr, membership(comm), weights = E(gr)$weight),
-      eta2_GDP = eta_squared(fp$GDP, mv), eta2_TMX = eta_squared(fp$TMX, mv))
-    cat(sprintf("Step 5: %s pool %d done | elapsed %.1f min\n", crop_name, ps, as.numeric(difftime(Sys.time(), t0, units = "mins"))))
-  }
-  res <- bind_rows(summ); write_xlsx(res, f5); print(res)
-}
+# ---- Save everything as Excel (no RDS) ----
+out_path <- file.path(proj_dir, "negstep11_output.xlsx")
 
-# =============================================================================
-# STEP 6 -- Community-assignment stability across R
-# =============================================================================
-step6 <- function() {
-  s1 <- read_step1(); rows <- list(); n_seeds6 <- 10                       # Louvain is stochastic -> average over seeds
-  for (crop_name in crops) {
-    g1 <- build_graph(s1, crop_name, "NT_lasso", 1)                        # graph from repeat 1 only
-    g3 <- build_graph(s1, crop_name, "NT_lasso", 3)                        # graph from repeats 1-3
-    g5 <- build_graph(s1, crop_name, "NT_lasso", n_repeats)                # graph from all repeats
-    one_seed <- function(sd) {
-      m1 <- membership(louvain(g1, sd)); m3 <- membership(louvain(g3, sd)); m5 <- membership(louvain(g5, sd))
-      m5b <- membership(louvain(g5, sd + 1000))                            # same graph, different seed = noise ceiling
-      a15 <- partition_agreement(m1, m5); a35 <- partition_agreement(m3, m5); a55 <- partition_agreement(m5, m5b)
-      c(ARI_R1_vs_R5 = a15[["ARI"]], NMI_R1_vs_R5 = a15[["NMI"]],
-        ARI_R3_vs_R5 = a35[["ARI"]], NMI_R3_vs_R5 = a35[["NMI"]],
-        ARI_R5_seed_vs_seed = a55[["ARI"]], NMI_R5_seed_vs_seed = a55[["NMI"]])
-    }
-    mat <- sapply(seq_len(n_seeds6), one_seed)                             # 6 x n_seeds matrix
-    rows[[length(rows) + 1]] <- data.frame(
-      crop = crop_name, as.list(rowMeans(mat)),                            # mean over seeds
-      setNames(as.list(apply(mat, 1, sd)), paste0(rownames(mat), "_sd"))) # sd over seeds
-  }
-  res <- bind_rows(rows); write_xlsx(res, out_file("networkstep6_output.xlsx")); print(res)
-}
+wb <- createWorkbook()
+addWorksheet(wb, "sensitivity_grid")   # crop x config negative-transfer prevalence, plus pooled row per config
 
-# =============================================================================
-# STEP 7 -- Null model 2: degree-preserving topology randomization
-# =============================================================================
-step7 <- function() {
-  s1 <- read_step1(); rows <- list()
-  for (crop_name in crops) for (metric in metrics) {
-    sd0 <- 7000 + 10 * seed_index(crop_name) + (metric == "NT_xgb")
-    gr <- build_graph(s1, crop_name, metric)
-    real_mod <- modularity(gr, membership(louvain(gr, 1)), weights = E(gr)$weight)
-    deg <- degree(gr); w_obs <- E(gr)$weight; set.seed(sd0)
-    null_mods <- c()
-    for (i in seq_len(n_null)) {
-      g2 <- random_degseq_graph(deg)                                       # random graph with the same degree sequence
-      g2 <- simplify(g2, remove.multiple = TRUE, remove.loops = TRUE)      # collapse multi-edges, drop self-loops
-      if (ecount(g2) == 0) next
-      E(g2)$weight <- sample(w_obs, ecount(g2), replace = TRUE)            # random weights drawn from the observed ones
-      m2 <- cluster_louvain(g2, weights = E(g2)$weight)
-      null_mods <- c(null_mods, modularity(g2, membership(m2), weights = E(g2)$weight))
-    }
-    n_ge <- sum(null_mods >= real_mod)
-    rows[[length(rows) + 1]] <- data.frame(
-      crop = crop_name, metric = metric, modularity_real = real_mod,
-      null2_mean = mean(null_mods), null2_sd = sd(null_mods), n_draws = length(null_mods), n_null_ge = n_ge,
-      p_raw = n_ge / length(null_mods), p_plus1 = (n_ge + 1) / (length(null_mods) + 1))
-    cat("Step 7:", crop_name, metric, "done\n")
-  }
-  res <- bind_rows(rows); write_xlsx(res, out_file("networkstep7_output.xlsx")); print(res)
-}
+writeData(wb, "sensitivity_grid", results_all)
 
-# =============================================================================
-# STEP 8 -- Diagnostics behind the audit, stabilization and rye/sorghum tables
-# =============================================================================
-step8 <- function() {
-  s1 <- read_step1()
-  # (a) pair-count audit: rows in Step 1 output vs the design formula N(N-1-|S|) x R
-  audit <- s1 %>% group_by(crop) %>%
-    summarise(eligible_N = n_distinct(target), rows_total = n(), .groups = "drop") %>%
-    mutate(pairs_per_repeat = eligible_N * (eligible_N - 1 - pool_size),
-           formula_total = pairs_per_repeat * n_repeats, matches_formula = rows_total == formula_total)
-  cat("Total NT observations:", sum(audit$rows_total), "\n")
-  # (b) prevalence of NT_lasso < 0 by R, and pair-level sign agreement.
-  #     A pair can be absent from some repeats (its candidate sat in that repeat's pool), so the
-  #     R=k estimate is the mean over the repeats <= k in which the pair exists (NaN if none).
-  mk <- s1 %>% group_by(crop, target, candidate) %>%
-    summarise(m1 = mean(NT_lasso[repeat_id <= 1]), m2 = mean(NT_lasso[repeat_id <= 2]),
-              m3 = mean(NT_lasso[repeat_id <= 3]), m4 = mean(NT_lasso[repeat_id <= 4]),
-              m5 = mean(NT_lasso[repeat_id <= 5]), .groups = "drop")
-  prevalence <- data.frame(R = 1:5,
-    n_pairs_defined = sapply(1:5, function(k) sum(!is.nan(mk[[paste0("m", k)]]))),
-    prevalence_negative = sapply(1:5, function(k) mean(mk[[paste0("m", k)]] < 0, na.rm = TRUE)))
-  ok3 <- !is.nan(mk$m3) & !is.nan(mk$m5); ok1 <- !is.nan(mk$m1) & !is.nan(mk$m5)  # pairs defined at both R levels
-  flipped <- ok3 & ((mk$m3 < 0) != (mk$m5 < 0))                           # sign differs between R=3 and R=5
-  agreement <- data.frame(
-    sign_agreement_R1_R5 = mean((mk$m1[ok1] < 0) == (mk$m5[ok1] < 0)),
-    sign_agreement_R3_R5 = mean((mk$m3[ok3] < 0) == (mk$m5[ok3] < 0)),
-    median_abs_NT_flipped = median(abs(mk$m5[flipped])), median_abs_NT_stable = median(abs(mk$m5[ok3 & !flipped])))
-  # (c) dispersion of R-averaged NT_xgb relative to NT_lasso
-  disp <- s1 %>% group_by(crop, target, candidate) %>%
-    summarise(NT_lasso = mean(NT_lasso), NT_xgb = mean(NT_xgb), .groups = "drop") %>%
-    group_by(crop) %>% summarise(NT_lasso_sd = sd(NT_lasso), NT_xgb_sd = sd(NT_xgb), .groups = "drop") %>%
-    mutate(xgb_over_lasso_ratio = NT_xgb_sd / NT_lasso_sd)
-  # (d) raw-yield diagnostics for eligible countries: skewness, max/median, share of short-history countries
-  skew_g1 <- function(x) { n <- length(x); m <- mean(x)                    # bias-adjusted sample skewness (G1)
-    (sqrt(n * (n - 1)) / (n - 2)) * (mean((x - m)^3) / mean((x - m)^2)^1.5) }
-  yd <- bind_rows(lapply(crops, function(cn) {
-    d <- read_panel(cn); cnt <- d %>% count(Country_ISO) %>% filter(n >= min_obs)
-    y <- na.omit(d[[y_col]][d$Country_ISO %in% cnt$Country_ISO])
-    data.frame(crop = cn, yield_skewness = skew_g1(y), yield_max_over_median = max(y) / median(y),
-               pct_countries_30_to_35_obs = 100 * mean(cnt$n <= 35))
-  }))
-  write_xlsx(list(audit = audit, prevalence_by_R = prevalence, sign_agreement = agreement,
-                  dispersion = disp, yield_diagnostics = yd), out_file("networkstep8_output.xlsx"))
-  print(audit); print(prevalence); print(agreement); print(disp); print(yd)
-}
+saveWorkbook(wb, out_path, overwrite = TRUE)
 
-# =============================================================================
-# STEP 9 -- Figures 1 and 2 (axis labels only; titles/captions live in the manuscript)
-# =============================================================================
-step9 <- function() {
-  library(ggplot2); library(ggpattern)                                     # install.packages("ggpattern") if missing
-  s2 <- read_excel(out_file("networkstep2_output.xlsx"))
-  # Figure 1: observed modularity (solid) vs null-model-1 mean (hollow), LASSO
-  f1 <- s2 %>% filter(metric == "NT_lasso") %>% mutate(crop = factor(crop, levels = names(crop_colors)))
-  yr <- max(f1$modularity_real)
-  fig1 <- ggplot(f1, aes(x = crop)) +
-    geom_segment(aes(xend = crop, y = modularity_null_mean, yend = modularity_real, color = crop), alpha = 0.5, linewidth = 0.6) +
-    geom_point(aes(y = modularity_null_mean, color = crop), shape = 21, fill = "white", stroke = 1.4, size = 4) +
-    geom_point(aes(y = modularity_real, color = crop, fill = crop), shape = 21, stroke = 1.4, size = 4) +
-    scale_color_manual(values = crop_colors, guide = "none") + scale_fill_manual(values = crop_colors, guide = "none") +
-    annotate("point", x = 6.3, y = yr + 0.045, shape = 21, fill = "grey50", color = "grey50", stroke = 1.4, size = 4) +
-    annotate("text",  x = 6.5, y = yr + 0.045, label = "Observed", hjust = 0, size = 3.6) +
-    annotate("point", x = 6.3, y = yr + 0.005, shape = 21, fill = "white", color = "grey50", stroke = 1.4, size = 4) +
-    annotate("text",  x = 6.5, y = yr + 0.005, label = "Null (weight-shuffled)", hjust = 0, size = 3.6) +
-    coord_cartesian(ylim = c(NA, yr + 0.06)) + labs(x = "Crop", y = "Modularity") +
-    theme_minimal(base_size = 12) + theme(panel.grid.minor = element_blank())
-  for (ext in c("pdf", "png", "tiff"))
-    ggsave(file.path(fig_dir, paste0("fig1_modularity_vs_null.", ext)), fig1, width = 7, height = 4.8, dpi = 300)
-  # Figure 2: ARI / NMI vs climate-GDP clusters; LASSO solid, XGBoost striped (same colour)
-  f2 <- s2 %>% select(crop, metric, ARI_vs_climate, NMI_vs_climate) %>%
-    pivot_longer(c(ARI_vs_climate, NMI_vs_climate), names_to = "stat", values_to = "value") %>%
-    mutate(crop = factor(crop, levels = names(crop_colors)),
-           stat = recode(stat, ARI_vs_climate = "ARI", NMI_vs_climate = "NMI"),
-           model = recode(metric, NT_lasso = "LASSO", NT_xgb = "XGBoost"))
-  fig2 <- ggplot(f2, aes(x = crop, y = value, fill = crop, pattern = model)) +
-    geom_col_pattern(position = position_dodge(width = 0.8), width = 0.7, color = "black", pattern_fill = "white",
-                     pattern_density = 0.35, pattern_spacing = 0.02, pattern_angle = 45, pattern_color = NA) +
-    scale_fill_manual(values = crop_colors, guide = "none") +
-    scale_pattern_manual(values = c(LASSO = "none", XGBoost = "stripe"), name = "Model") +
-    facet_wrap(~stat) + labs(x = "Crop", y = "Agreement with climate/GDP clusters") +
-    theme_minimal(base_size = 12) +
-    theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "top",
-          legend.spacing.x = unit(1.2, "cm"), legend.box.spacing = unit(0.5, "cm"), legend.title = element_blank())
-  for (ext in c("pdf", "png", "tiff"))
-    ggsave(file.path(fig_dir, paste0("fig2_ari_nmi_climate.", ext)), fig2, width = 8, height = 5, dpi = 300)
-  cat("Figures saved to:", fig_dir, "\n")
-}
-
-# =============================================================================
-# DRIVER
-# =============================================================================
-t_all <- Sys.time()
-for (s in RUN_ORDER) if (RUN[paste0("step", s)]) {
-  cat("\n================ STEP", s, "================\n")
-  get(paste0("step", s))()                                                 # call step1() ... step9()
-}
-cat("\nPIPELINE FINISHED in", round(as.numeric(difftime(Sys.time(), t_all, units = "mins")), 1), "minutes\n")
+cat("\nStep 11 complete. Output saved to:\n", out_path, "\n")
+cat("Check the ALL_CROPS_POOLED rows across configs: stable pct_negative_lasso/xgb across N_pool and seed supports the headline prevalence claim; large swings would indicate strong pool-size/composition dependence.\n")
