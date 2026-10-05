@@ -1,9 +1,7 @@
 
 # Negative Transfer in Multi-Country Crop-Yield Prediction — Code & Data
 
-This repository contains the R pipeline behind the paper *"Negative Transfer in
-Multi-Country Crop-Yield Prediction: Prevalence, Predictability, and Its Limits
-Across Crops."*
+This repository contains the R pipeline behind the paper.
 
 ## Getting started
 
